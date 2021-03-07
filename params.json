@@ -66,7 +66,7 @@
     "save_checkpoint_steps": 5000,
     "keep_checkpoint": 3,
 
-    "log_file": "train.log",
+    "log_file": "out.log",
     "start_decay_steps": 50000,
     "decay_steps": 10000,
     "adam_beta1": 0.9,

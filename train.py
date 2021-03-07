@@ -7,7 +7,6 @@ import warnings
 from datetime import datetime
 
 import glob2 as glob
-import onmt.opts as opts
 import torch
 import torch.distributed
 from loguru import logger
