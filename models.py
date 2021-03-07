@@ -4,7 +4,126 @@ from __future__ import division
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from attention import aeq, GlobalAttention
+from embedding import Embeddings
+from constants import PAD_WORD
+
+def build_model(opt, vocab, checkpoint=None, gpu=False):
+
+    device = torch.device("cuda" if gpu else "cpu")
+
+    image_channel_size = 3
+
+    encoder = ImageEncoder(
+        opt.enc_layers, opt.brnn, opt.rnn_size, opt.dropout, image_channel_size,
+    )
+
+    embedding_dim = opt.tgt_word_vec_size
+
+    word_padding_idx = vocab.stoi[PAD_WORD]
+    num_word_embeddings = len(vocab)
+
+    tgt_embeddings = Embeddings(
+        word_vec_size=embedding_dim,
+        word_vocab_size=num_word_embeddings,
+        word_padding_idx=word_padding_idx,
+        position_encoding=opt.position_encoding,
+        dropout=opt.dropout,
+        sparse=opt.optim == "sparseadam",
+    )
+
+    decoder = InputFeedRNNDecoder(
+        opt.rnn_type,
+        opt.brnn,
+        opt.dec_layers,
+        opt.rnn_size,
+        attn_type=opt.global_attention,
+        # opt.global_attention_function,
+        attn_func="softmax",
+        dropout=opt.dropout,
+        embeddings=tgt_embeddings,
+    )
+
+    # Build NMTModel(= encoder + decoder).
+    model = NMTModel(encoder, decoder)
+
+    # Build Generator.
+    gen_func = nn.LogSoftmax(dim=-1)
+    generator = nn.Sequential(nn.Linear(opt.rnn_size, len(vocab)), gen_func)
+
+    # Load the model states from checkpoint or initialize them.
+    if checkpoint is not None:
+        model.load_state_dict(checkpoint["model"], strict=False)
+        generator.load_state_dict(checkpoint["generator"], strict=False)
+    else:
+        if opt.param_init != 0.0:
+            for p in model.parameters():
+                p.data.uniform_(-opt.param_init, opt.param_init)
+            for p in generator.parameters():
+                p.data.uniform_(-opt.param_init, opt.param_init)
+
+        model.decoder.embeddings.load_pretrained_vectors(
+            opt.pre_word_vecs_dec, opt.fix_word_vecs_dec
+        )
+
+    # Add generator to model (this registers it as parameter of model).
+    model.generator = generator
+    model.to(device)
+
+    return model
+
+
+class NMTModel(nn.Module):
+    """
+    Core trainable object in OpenNMT. Implements a trainable interface
+    for a simple, generic encoder + decoder model.
+    Args:
+      encoder (:obj:`EncoderBase`): an encoder object
+      decoder (:obj:`RNNDecoderBase`): a decoder object
+      multi<gpu (bool): setup for multigpu support
+    """
+
+    def __init__(self, encoder, decoder, multigpu=False):
+        self.multigpu = multigpu
+        super(NMTModel, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, src, tgt, lengths, dec_state=None):
+        """Forward propagate a `src` and `tgt` pair for training.
+        Possible initialized with a beginning decoder state.
+        Args:
+            src (:obj:`Tensor`):
+                a source sequence passed to encoder.
+                typically for inputs this will be a padded :obj:`LongTensor`
+                of size `[len x batch x features]`. however, may be an
+                image or other generic input depending on encoder.
+            tgt (:obj:`LongTensor`):
+                 a target sequence of size `[tgt_len x batch]`.
+            lengths(:obj:`LongTensor`): the src lengths, pre-padding `[batch]`.
+            dec_state (:obj:`DecoderState`, optional): initial decoder state
+        Returns:
+            (:obj:`FloatTensor`, `dict`, :obj:`onmt.Models.DecoderState`):
+                 * decoder output `[tgt_len x batch x hidden]`
+                 * dictionary attention dists of `[tgt_len x batch x src_len]`
+                 * final decoder state
+        """
+        tgt = tgt[:-1]  # exclude last target from inputs
+
+        enc_final, memory_bank, lengths = self.encoder(src, lengths)
+        enc_state = self.decoder.init_decoder_state(src, memory_bank, enc_final)
+        decoder_outputs, dec_state, attns = self.decoder(
+            tgt,
+            memory_bank,
+            enc_state if dec_state is None else dec_state,
+            memory_lengths=lengths,
+        )
+        if self.multigpu:
+            # Not yet supported on multi-gpu
+            dec_state = None
+            attns = None
+        return decoder_outputs, attns, dec_state
 
 
 class ImageEncoder(nn.Module):

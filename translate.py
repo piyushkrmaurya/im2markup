@@ -4,17 +4,13 @@ from collections import defaultdict
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torchtext
 from torchvision import transforms
 
 from PIL import Image
 
 from beam import Beam, GNMTGlobalScorer
-from embedding import Embeddings
-from models import ImageEncoder, InputFeedRNNDecoder
-from nmt import NMTModel
 from preprocess import preprocess_image
+from models import build_model
 
 warnings.filterwarnings("ignore")
 
@@ -29,70 +25,6 @@ specials = [PAD_WORD, UNK_WORD, BOS_WORD, EOS_WORD]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # device = "cpu"
-
-
-def get_model(opt, vocab, checkpoint=None):
-
-    image_channel_size = 3
-
-    encoder = ImageEncoder(
-        opt.enc_layers, opt.brnn, opt.rnn_size, opt.dropout, image_channel_size,
-    )
-
-    embedding_dim = opt.tgt_word_vec_size
-
-    word_padding_idx = vocab.stoi[PAD_WORD]
-    num_word_embeddings = len(vocab)
-
-    tgt_embeddings = Embeddings(
-        word_vec_size=embedding_dim,
-        word_vocab_size=num_word_embeddings,
-        word_padding_idx=word_padding_idx,
-        position_encoding=opt.position_encoding,
-        dropout=opt.dropout,
-        sparse=opt.optim == "sparseadam",
-    )
-
-    decoder = InputFeedRNNDecoder(
-        opt.rnn_type,
-        opt.brnn,
-        opt.dec_layers,
-        opt.rnn_size,
-        attn_type=opt.global_attention,
-        # opt.global_attention_function,
-        attn_func="softmax",
-        dropout=opt.dropout,
-        embeddings=tgt_embeddings,
-    )
-
-    # Build NMTModel(= encoder + decoder).
-    model = NMTModel(encoder, decoder)
-
-    # Build Generator.
-    gen_func = nn.LogSoftmax(dim=-1)
-    generator = nn.Sequential(nn.Linear(opt.rnn_size, len(vocab)), gen_func)
-
-    # Load the model states from checkpoint or initialize them.
-    if checkpoint is not None:
-        model.load_state_dict(checkpoint["model"], strict=False)
-        generator.load_state_dict(checkpoint["generator"], strict=False)
-    else:
-        if opt.param_init != 0.0:
-            for p in model.parameters():
-                p.data.uniform_(-opt.param_init, opt.param_init)
-            for p in generator.parameters():
-                p.data.uniform_(-opt.param_init, opt.param_init)
-
-        model.decoder.embeddings.load_pretrained_vectors(
-            opt.pre_word_vecs_dec, opt.fix_word_vecs_dec
-        )
-
-    # Add generator to model (this registers it as parameter of model).
-    model.generator = generator
-    model.to(device)
-
-    return model
-
 
 def translate(img_path, model, vocab, n_best=3, beam_size=5, max_length=150):
 
@@ -202,7 +134,7 @@ def generate_latex(img_path):
 
     opt = checkpoint["opt"]
 
-    model = get_model(opt, vocab, checkpoint=checkpoint)
+    model = build_model(opt, vocab, checkpoint=checkpoint, gpu=(str(device) == "cuda"))
     model.eval()
     model.generator.eval()
 

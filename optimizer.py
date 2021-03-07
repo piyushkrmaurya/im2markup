@@ -2,6 +2,45 @@ import torch
 import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 
+def build_optim(model, opt, checkpoint):
+    """ Build optimizer """
+    saved_optimizer_state_dict = None
+
+    if opt.train_from:
+        optim = checkpoint["optim"]
+        saved_optimizer_state_dict = optim.optimizer.state_dict()
+    else:
+        optim = Optimizer(
+            opt.optim,
+            opt.learning_rate,
+            opt.max_grad_norm,
+            lr_decay=opt.learning_rate_decay,
+            start_decay_steps=opt.start_decay_steps,
+            decay_steps=opt.decay_steps,
+            beta1=opt.adam_beta1,
+            beta2=opt.adam_beta2,
+            adagrad_accum=opt.adagrad_accumulator_init,
+            decay_method=opt.decay_method,
+            warmup_steps=opt.warmup_steps,
+            model_size=opt.rnn_size,
+        )
+
+    optim.set_parameters(model.named_parameters())
+
+    if opt.train_from:
+        optim.optimizer.load_state_dict(saved_optimizer_state_dict)
+        if use_gpu(opt):
+            for state in optim.optimizer.state.values():
+                for k, v in state.items():
+                    if torch.is_tensor(v):
+                        state[k] = v.cuda()
+        if (optim.method == "adam") and (len(optim.optimizer.state) < 1):
+            raise RuntimeError(
+                "Error: loaded Adam optimizer from existing model"
+                + " but optimizer state is empty"
+            )
+
+    return optim
 
 class Optimizer:
     def __init__(

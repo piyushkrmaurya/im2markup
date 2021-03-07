@@ -1,7 +1,7 @@
 import sys, os, argparse, json, glob, logging
 import numpy as np
 from PIL import Image
-
+import cv2
 
 def crop_image(img, default_size=None):
     old_im = img.convert("L")
@@ -47,8 +47,11 @@ def pad_group_image(img, pad_size, buckets):
 
 
 def downsample_image(img, ratio):
+    assert ratio > 0
     old_im = img
-    assert ratio >= 1, ratio
+    width, height = old_im.size
+    if width < 420 or height < 100:
+        return old_im
     if ratio == 1:
         return old_im
     old_size = old_im.size
@@ -85,7 +88,7 @@ def preprocess_image(
     ],
     downsample_ratio=2.0,
 ):
-    img = Image.open(img_path).convert("RGB")
+    img = Image.fromarray(cv2.imread(img_path, 0))
 
     img = crop_image(img, crop_blank_default_size)
     img = pad_group_image(img, pad_size, buckets)
