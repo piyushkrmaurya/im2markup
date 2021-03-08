@@ -25,6 +25,7 @@ from utils import (
     build_dataset_iter,
     lazily_load_dataset,
     make_features,
+    use_gpu
 )
 
 warnings.filterwarnings("ignore")
@@ -47,12 +48,6 @@ def init_logger(log_file):
         " <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
     )
 
-
-
-def use_gpu(opt):
-    return (hasattr(opt, "gpu_ranks") and len(opt.gpu_ranks) > 0) or (
-        hasattr(opt, "gpu") and opt.gpu > -1
-    )
 
 class Trainer(object):
     """

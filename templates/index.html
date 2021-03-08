@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <link href="https://fonts.googleapis.com/css?family=Roboto:100,300,400,500,700,900" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/@mdi/font@4.x/css/materialdesignicons.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/vuetify@2.x/dist/vuetify.min.css" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, minimal-ui">
+    <style>
+        body {
+            font-family: Arial
+        }
+
+        img {
+            max-width: 600px;
+        }
+
+        pre {
+            color: black;
+            white-space: pre-wrap;
+            white-space: -moz-pre-wrap;
+            font-size: 14pt;
+        }
+        .MathJax {
+            color: black;
+            font-size: 3em !important;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="app">
+        <v-app>
+            <v-app-bar dark absolute color="primary" app>
+                <v-toolbar-title>im2markup</v-toolbar-title>
+                <v-spacer></v-spacer>
+                <v-btn color="white" light href="/sample">Samples</v-btn>
+            </v-app-bar>
+            <v-main>
+                <v-container class="px-16">
+                    <v-card tile outlined :loading="loading" :color="dropping ? 'grey lighten-4' : ''">
+                        <v-card-title>
+                            Select Image
+                        </v-card-title>
+                        <v-card-text>
+                            <v-row dropzone tile :height="height" @drop.prevent="drop"
+                                @dragover.prevent="dropping = true" @dragleave.prevent="dropping = false"
+                                @click="$refs.import.click()">
+                                <v-col cols="12" justify="center" align="center">
+                                    Drag an image here or paste using Ctrl+V
+                                </v-col>
+                                <v-col cols="12" justify="center" align="center">
+                                    <v-btn :small="small" color="primary" :loading="loading">
+                                        or select image
+                                    </v-btn>
+                                </v-col>
+                                <v-col cols="12" justify="center" align="center">
+                                    <img id="input" />
+                                </v-col>
+                                <input v-show="false" ref="import" type="file" @change="selectFiles" />
+                            </v-row>
+                        </v-card-text>
+                    </v-card>
+                    <v-card tile outlined v-show="output.length">
+                        <v-card-title>
+                            Latex Output
+                        </v-card-title>
+                        <v-card-text>
+                            <v-row>
+                                <v-col cols="12" justify="center" align="center">
+                                    <pre>[[output]]</pre>
+                                </v-col>
+                            </v-row>
+                        </v-card-text>
+                    </v-card>
+                    <v-card tile outlined v-show="output.length">
+                        <v-card-title>
+                            Rendered Output
+                        </v-card-title>
+                        <v-card-text>
+                            <v-row>
+                                <v-col ref="render" cols="12" justify="center" align="center">
+                                </v-col>
+                            </v-row>
+                        </v-card-text>
+                    </v-card>
+
+                </v-container>
+            </v-main>
+        </v-app>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/vue@2.x/dist/vue.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vuetify@2.x/dist/vuetify.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/axios/0.21.1/axios.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.12.0/katex.min.css">
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script>
+        MathJax = {
+            tex: {
+                inlineMath: [['$$', '$$'], ['\\(', '\\)']]
+            },
+            svg: {
+                fontCache: 'global'
+            }
+        };
+    </script>
+    <script src="http://cdn.mathjax.org/mathjax/latest/MathJax.js">
+        MathJax.Hub.Config({
+            extensions: ["tex2jax.js"],
+            jax: ["input/TeX", "output/HTML-CSS"],
+            tex2jax: {
+                inlineMath: [['$', '$'], ["\\(", "\\)"]],
+                displayMath: [['$$', '$$'], ["\\[", "\\]"]],
+            },
+            "HTML-CSS": { availableFonts: ["TeX"] }
+        });
+    </script>
+
+    <script>
+        new Vue({
+            delimiters: ["[[", "]]"],
+            el: '#app',
+            vuetify: new Vuetify(),
+            data() {
+                return {
+                    small: false,
+                    height: "500px",
+                    saveOnServer: true,
+                    uploadPercentage: 0,
+                    dropping: false,
+                    loading: false,
+                    uploadUrl: "api/",
+                    contentTypes: {
+                        "text": "application/json",
+                        "file": "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW"
+                    },
+                    output: ""
+                }
+            },
+            methods: {
+                drop(e) {
+                    this.dropping = false
+                    const html = e.dataTransfer.getData("text/html")
+                    const files = e.target.files || e.dataTransfer.files
+                    if (html && html.length) {
+                        const regex = /src="?([^"\s]+)"?\s*/
+                        let url = regex.exec(html)
+                        if (!url || url.length < 1) return
+                        else url = url[1]
+                        const vm = this
+                        this.checkImage(url, function (valid) {
+                            if (valid) {
+                                var image = document.getElementById('input');
+                                image.src = url;
+                                let data = { url }
+                                vm.uploadImage(data, "text")
+                            } else console.log("Invalid Image")
+                        })
+                    } else if (files && files.length) {
+                        const file = files[0]
+                        const formData = new FormData()
+                        formData.append("file", file, file.name)
+                        if (file.type.indexOf("image") === 0) {
+                            var image = document.getElementById('input');
+                            image.src = URL.createObjectURL(file);
+                            this.uploadImage(formData, "file")
+                        }
+                    }
+                },
+                selectFiles(e) {
+                    const file = e.target.files[0]
+                    const vm = this
+                    if (file.type.indexOf("image") === 0) {
+                        var image = document.getElementById('input');
+                        image.src = URL.createObjectURL(file);
+                        const reader = new FileReader()
+                        reader.readAsDataURL(file)
+                        const formData = new FormData()
+                        formData.append("file", file, file.name)
+                        vm.uploadImage(formData, "file")
+                    }
+                },
+                uploadImage(data, type) {
+                    this.loading = true
+                    axios
+                        .post(this.uploadUrl, data, {
+                            headers: {
+                                "Content-Type": this.contentTypes[type]
+                            },
+                            onUploadProgress: function (event) {
+                                this.uploadPercentage = parseInt(Math.round((event.loaded / event.total) * 100))
+                            }.bind(this)
+                        })
+                        .then(this.afterUpload, (error) => {
+                            console.log(error)
+                            this.loading = false
+                        })
+                },
+                afterUpload(response) {
+                    const data = response.data
+                    if (data) {
+                        this.output = data
+                        const el = this.$refs.render
+                        el.innerHTML = "$$" + data + "$$"
+                        MathJax.Hub.Queue(["Typeset", MathJax.Hub, el]);
+                    } else if (data.error && data.error.message) {
+                        console.log(data.error.message)
+                    }
+                    this.uploadPercentage = 0
+                    this.loading = false
+                },
+                checkImage(url, callback) {
+                    const image = new Image()
+                    image.onload = function () {
+                        callback(true)
+                    }
+                    image.onerror = function () {
+                        callback(false)
+                    }
+                    image.src = url
+                }
+            },
+            mounted() {
+                const vm = this;
+                document.onpaste = function (event) {
+                    var items = (event.clipboardData || event.originalEvent.clipboardData).items;
+                    for (index in items) {
+                        var item = items[index];
+                        if (item.kind === 'file') {
+                            var blob = item.getAsFile();
+                            var image = document.getElementById('input');
+                            image.src = URL.createObjectURL(blob);
+                            var reader = new FileReader();
+                            reader.readAsDataURL(blob)
+                            const formData = new FormData()
+                            formData.append("file", blob,)
+                            vm.uploadImage(formData, "file")
+                            break
+                        }
+                    }
+                }
+            }
+        });
+    </script>
+</body>
+
+</html>

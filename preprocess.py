@@ -50,8 +50,6 @@ def downsample_image(img, ratio):
     assert ratio > 0
     old_im = img
     width, height = old_im.size
-    if width < 420 or height < 100:
-        return old_im
     if ratio == 1:
         return old_im
     old_size = old_im.size
@@ -60,7 +58,7 @@ def downsample_image(img, ratio):
     return new_im
 
 def preprocess_image(
-    img_path,
+    img,
     crop_blank_default_size=[600, 60],
     pad_size=[8, 8, 8, 8],
     buckets=[
@@ -86,9 +84,12 @@ def preprocess_image(
         [1600, 200],
         [1600, 1600],
     ],
-    downsample_ratio=2.0,
+    downsample_ratio=4,
 ):
-    img = Image.fromarray(cv2.imread(img_path, 0))
+    if isinstance(img, str):
+        img = Image.fromarray(cv2.imread(img, 0))
+    else:
+        img = Image.fromarray(img)
 
     img = crop_image(img, crop_blank_default_size)
     img = pad_group_image(img, pad_size, buckets)

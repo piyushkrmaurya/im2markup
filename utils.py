@@ -565,3 +565,9 @@ def lazily_load_dataset(corpus_type, opt):
         # Only one inputters.*Dataset, simple!
         pt = opt.data + '.' + corpus_type + '.pt'
         yield _lazy_dataset_loader(pt, corpus_type)
+
+
+def use_gpu(opt):
+    return (hasattr(opt, "gpu_ranks") and len(opt.gpu_ranks) > 0) or (
+        hasattr(opt, "gpu") and opt.gpu > -1
+    )

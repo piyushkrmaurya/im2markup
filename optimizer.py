@@ -2,6 +2,8 @@ import torch
 import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 
+from utils import use_gpu
+
 def build_optim(model, opt, checkpoint):
     """ Build optimizer """
     saved_optimizer_state_dict = None

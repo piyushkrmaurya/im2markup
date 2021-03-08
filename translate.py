@@ -26,7 +26,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # device = "cpu"
 
-def translate(img_path, model, vocab, n_best=3, beam_size=5, max_length=150):
+def translate(img, model, vocab, n_best=3, beam_size=5, max_length=150):
 
     scorer = GNMTGlobalScorer()
 
@@ -42,7 +42,6 @@ def translate(img_path, model, vocab, n_best=3, beam_size=5, max_length=150):
         )
     ]
 
-    img = preprocess_image(img_path)
     src = transforms.ToTensor()(img)
 
     src = src.unsqueeze(0)
@@ -120,7 +119,7 @@ def translate(img_path, model, vocab, n_best=3, beam_size=5, max_length=150):
     return ret
 
 
-def generate_latex(img_path):
+def generate_latex(img):
     # def load_test_model(opt, dummy_opt, model_path=None):
     model_path = "checkpoint.pt"
     checkpoint = torch.load(model_path, map_location=lambda storage, loc: storage)
@@ -139,7 +138,7 @@ def generate_latex(img_path):
     model.generator.eval()
 
     # dict_keys(['predictions', 'scores', 'attention'])
-    outputs = translate(img_path, model, vocab)
+    outputs = translate(img, model, vocab)
 
     if len(outputs["predictions"][0]) > 0:
         prediction = " ".join(
@@ -155,4 +154,6 @@ def generate_latex(img_path):
 
 
 if __name__ == "__main__":
-    print(generate_latex(sys.argv[1]))
+    img_path = sys.argv[1]
+    img = preprocess_image(img_path)
+    print(generate_latex(img))
