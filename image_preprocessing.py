@@ -37,11 +37,11 @@ def pad_group_image(img, pad_size, buckets):
             break
     if j < 0:
         new_size = old_size
-        new_im = Image.new("RGB", new_size, (255, 255, 255))
+        new_im = Image.new("L", new_size, 255)
         new_im.paste(old_im, (PAD_LEFT, PAD_TOP))
         return new_im
     new_size = buckets[j]
-    new_im = Image.new("RGB", new_size, (255, 255, 255))
+    new_im = Image.new("L", new_size, 255)
     new_im.paste(old_im, (PAD_LEFT, PAD_TOP))
     return new_im
 
@@ -84,17 +84,32 @@ def preprocess_image(
         [1600, 200],
         [1600, 1600],
     ],
-    downsample_ratio=4,
+    downsample_ratio=5,
 ):
     if isinstance(img, str):
-        img = Image.fromarray(cv2.imread(img, 0))
+        img = Image.open(img)
     else:
         img = Image.fromarray(img)
+    
+    print(img.mode)
+
+
+    if img.mode == "RGB":
+        img = img.convert("L")
+
+    elif img.mode == "RGBA":
+        img = img.convert("LA")
+
+    if img.mode == "LA":
+        new_img = Image.new("LA", img.size, "WHITE")
+        new_img.paste(img, (0, 0), img)
+        img = new_img.convert("L")
+
 
     img = crop_image(img, crop_blank_default_size)
     img = pad_group_image(img, pad_size, buckets)
     img = downsample_image(img, downsample_ratio)
-    
+
     return img
 
 

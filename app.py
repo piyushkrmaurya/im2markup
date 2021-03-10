@@ -6,7 +6,7 @@ import numpy as np
 import requests
 from flask import Flask, render_template, request
 
-from preprocess import preprocess_image
+from image_preprocessing import preprocess_image
 from translate import generate_latex
 
 app = Flask(__name__)
@@ -43,9 +43,6 @@ def api():
 
     else:
         return "Error"
-
-    if img.shape[2] == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     img = preprocess_image(img)
     img.save("client.png")

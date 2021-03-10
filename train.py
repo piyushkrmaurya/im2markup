@@ -1,37 +1,36 @@
-import argparse
 import json
+import math
 import os
-import signal
+import random
+import re
 import sys
+import time
+import traceback
 import warnings
-from datetime import datetime
+from argparse import Namespace
+from collections import deque
+from copy import copy, deepcopy
 
-import glob2 as glob
 import torch
-import torch.distributed
+import torch.nn as nn
 from loguru import logger
+from torch.nn.init import xavier_uniform_
 
-from distributed import all_gather_list, all_reduce_and_rescale_tensors, multi_init
+from dataset import DatasetIterator, IterOnDevice
 from loss import NMTLossCompute
-from models import build_model
-from optimizer import build_optim
+from models import (Cast, Embeddings, ImageEncoder, InputFeedRNNDecoder,
+                    NMTModel)
+from optimizer import Optimizer
+from utils import ModelSaver, ReportManager, Statistics
 
-from utils import (
-    ModelSaver,
-    ReportMgr,
-    Statistics,
-    _collect_report_features,
-    _load_fields,
-    build_dataset_iter,
-    lazily_load_dataset,
-    make_features,
-    use_gpu
-)
+# Fix CPU tensor sharing strategy
+torch.multiprocessing.set_sharing_strategy("file_system")
 
+# Ignore warnings
 warnings.filterwarnings("ignore")
 
 
-def init_logger(log_file):
+def init_logger(log_file=None):
     logger.remove()
 
     logger.add(
@@ -48,10 +47,197 @@ def init_logger(log_file):
         " <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
     )
 
+    return logger
+
+
+def build_model(model_opt, opt, fields, checkpoint):
+    logger.info("Building model...")
+
+    try:
+        model_opt.attention_dropout
+    except AttributeError:
+        model_opt.attention_dropout = model_opt.dropout
+
+
+    # Build encoder.
+    encoder = ImageEncoder.from_opt(model_opt)
+
+    # Build decoder.
+    tgt_field = fields["tgt"]
+    tgt_emb = Embeddings.from_opt(model_opt, tgt_field)
+    decoder = InputFeedRNNDecoder.from_opt(model_opt, tgt_emb)
+
+    # Build NMTModel(= encoder + decoder).
+    model = NMTModel(encoder, decoder)
+
+    # Build Generator.
+    gen_func = nn.LogSoftmax(dim=-1)
+    generator = nn.Sequential(
+        nn.Linear(model_opt.dec_rnn_size, len(fields["tgt"].base_field.vocab)),
+        Cast(torch.float32),
+        gen_func,
+    )
+    if model_opt.share_decoder_embeddings:
+        generator[0].weight = decoder.embeddings.word_lut.weight
+
+    # Load the model states from checkpoint or initialize them.
+    if checkpoint is not None:
+        # This preserves backward-compat for models using customed layernorm
+        def fix_key(s):
+            s = re.sub(r"(.*)\.layer_norm((_\d+)?)\.b_2", r"\1.layer_norm\2.bias", s)
+            s = re.sub(r"(.*)\.layer_norm((_\d+)?)\.a_2", r"\1.layer_norm\2.weight", s)
+            return s
+
+        checkpoint["model"] = {fix_key(k): v for k, v in checkpoint["model"].items()}
+        # end of patch for backward compatibility
+
+        model.load_state_dict(checkpoint["model"], strict=False)
+        generator.load_state_dict(checkpoint["generator"], strict=False)
+    else:
+        if model_opt.param_init != 0.0:
+            for p in model.parameters():
+                p.data.uniform_(-model_opt.param_init, model_opt.param_init)
+            for p in generator.parameters():
+                p.data.uniform_(-model_opt.param_init, model_opt.param_init)
+        if model_opt.param_init_glorot:
+            for p in model.parameters():
+                if p.dim() > 1:
+                    xavier_uniform_(p)
+            for p in generator.parameters():
+                if p.dim() > 1:
+                    xavier_uniform_(p)
+
+        if hasattr(model.encoder, "embeddings"):
+            model.encoder.embeddings.load_pretrained_vectors(
+                model_opt.pre_word_vecs_enc
+            )
+        if hasattr(model.decoder, "embeddings"):
+            model.decoder.embeddings.load_pretrained_vectors(
+                model_opt.pre_word_vecs_dec
+            )
+
+    model.generator = generator
+
+    model.to(opt.device)
+
+    logger.info(model)
+
+    return model
+
+
+def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
+    """
+    Simplify `Trainer` creation based on user `opt`s*
+
+    Args:
+        opt (:obj:`Namespace`): user options (usually from argument parsing)
+        model (:obj:`models.NMTModel`): the model to train
+        fields (dict): dict of fields
+        optim (:obj:`Optimizer`): optimizer used during training
+        data_type (str): string describing the type of data
+            e.g. "text", "img", "audio"
+        model_saver(:obj:`models.ModelSaverBase`): the utility object
+            used to save the model
+    """
+
+    tgt_field = dict(fields)["tgt"].base_field
+    train_loss = NMTLossCompute.from_opt(model, tgt_field, opt, device=opt.device)
+    valid_loss = NMTLossCompute.from_opt(model, tgt_field, opt, train=False, device=opt.device)
+
+    trunc_size = opt.truncated_decoder  # Badly named...
+    shard_size = opt.max_generator_batches if opt.model_dtype == "fp32" else 0
+    norm_method = opt.normalization
+    accum_count = opt.accum_count
+    accum_steps = opt.accum_steps
+    n_gpu = opt.world_size
+    average_decay = opt.average_decay
+    average_every = opt.average_every
+    dropout = opt.dropout
+    dropout_steps = opt.dropout_steps
+    if device_id >= 0:
+        gpu_rank = opt.gpu_ranks[device_id]
+    else:
+        gpu_rank = 0
+        n_gpu = 0
+    gpu_verbose_level = opt.gpu_verbose_level
+
+    earlystopper = (
+        EarlyStopping(
+            opt.early_stopping, scorers=scorers_from_opts(opt)
+        )
+        if opt.early_stopping > 0
+        else None
+    )
+
+    source_noise = None
+    if len(opt.src_noise) > 0:
+        src_field = dict(fields)["src"].base_field
+        corpus_id_field = dict(fields).get("corpus_id", None)
+        if corpus_id_field is not None:
+            ids_to_noise = corpus_id_field.numericalize(opt.data_to_noise)
+        else:
+            ids_to_noise = None
+        source_noise = source_noise.MultiNoise(
+            opt.src_noise,
+            opt.src_noise_prob,
+            ids_to_noise=ids_to_noise,
+            pad_idx=src_field.pad_token,
+            end_of_sentence_mask=src_field.end_of_sentence_mask,
+            word_start_mask=src_field.word_start_mask,
+            device_id=device_id,
+        )
+
+    report_manager = ReportManager(opt.report_every, start_time=-1)
+    trainer = Trainer(
+        model,
+        train_loss,
+        valid_loss,
+        optim,
+        trunc_size,
+        shard_size,
+        norm_method,
+        accum_count,
+        accum_steps,
+        n_gpu,
+        gpu_rank,
+        gpu_verbose_level,
+        report_manager,
+        model_saver=model_saver if gpu_rank == 0 else None,
+        average_decay=average_decay,
+        average_every=average_every,
+        model_dtype=opt.model_dtype,
+        earlystopper=earlystopper,
+        dropout=dropout,
+        dropout_steps=dropout_steps,
+        source_noise=source_noise,
+    )
+    return trainer
+
 
 class Trainer(object):
     """
     Class that controls the training process.
+
+    Args:
+            model(:py:class:`models.model.NMTModel`): translation model
+                to train
+            train_loss(:obj:`loss.LossComputeBase`):
+               training loss computation
+            valid_loss(:obj:`loss.LossComputeBase`):
+               training loss computation
+            optim(:obj:`optimizers.Optimizer`):
+               the optimizer responsible for update
+            trunc_size(int): length of truncated back propagation through time
+            shard_size(int): compute loss in shards of this size for efficiency
+            data_type(string): type of the source input: [text|img|audio]
+            norm_method(string): normalization methods: [sents|tokens]
+            accum_count(list): accumulate gradients this many times.
+            accum_steps(list): steps for accum gradients changes.
+            report_manager(:obj:`ReportMgrBase`):
+                the object that creates reports, or None
+            model_saver(:obj:`models.ModelSaverBase`): the saver is
+                used to save a checkpoint.
+                Thus nothing will be saved if this parameter is None
     """
 
     def __init__(
@@ -62,14 +248,21 @@ class Trainer(object):
         optim,
         trunc_size=0,
         shard_size=32,
-        data_type="text",
         norm_method="sents",
-        grad_accum_count=1,
+        accum_count=[1],
+        accum_steps=[0],
         n_gpu=1,
         gpu_rank=1,
         gpu_verbose_level=0,
         report_manager=None,
         model_saver=None,
+        average_decay=0,
+        average_every=1,
+        model_dtype="fp32",
+        earlystopper=None,
+        dropout=[0.3],
+        dropout_steps=[0],
+        source_noise=None,
     ):
         # Basic attributes.
         self.model = model
@@ -78,176 +271,238 @@ class Trainer(object):
         self.optim = optim
         self.trunc_size = trunc_size
         self.shard_size = shard_size
-        self.data_type = data_type
         self.norm_method = norm_method
-        self.grad_accum_count = grad_accum_count
+        self.accum_count_l = accum_count
+        self.accum_count = accum_count[0]
+        self.accum_steps = accum_steps
         self.n_gpu = n_gpu
         self.gpu_rank = gpu_rank
         self.gpu_verbose_level = gpu_verbose_level
         self.report_manager = report_manager
         self.model_saver = model_saver
+        self.average_decay = average_decay
+        self.moving_average = None
+        self.average_every = average_every
+        self.model_dtype = model_dtype
+        self.earlystopper = earlystopper
+        self.dropout = dropout
+        self.dropout_steps = dropout_steps
+        self.source_noise = source_noise
 
-        assert grad_accum_count > 0
-        if grad_accum_count > 1:
-            assert (
-                self.trunc_size == 0
-            ), """To enable accumulated gradients,
-                   you must disable target sequence truncating."""
+        for i in range(len(self.accum_count_l)):
+            assert self.accum_count_l[i] > 0
+            if self.accum_count_l[i] > 1:
+                assert (
+                    self.trunc_size == 0
+                ), """To enable accumulated gradients,
+                       you must disable target sequence truncating."""
 
         # Set model in training mode.
         self.model.train()
 
-    def train(self, train_iter_fct, valid_iter_fct, train_steps, valid_steps):
-        """
-        The main training loops.
-        by iterating over training data (i.e. `train_iter_fct`)
-        and running validation (i.e. iterating over `valid_iter_fct`
-        Args:
-            train_iter_fct(function): a function that returns the train
-                iterator. e.g. something like
-                train_iter_fct = lambda: generator(*args, **kwargs)
-            valid_iter_fct(function): same as train_iter_fct, for valid data
-            train_steps(int):
-            valid_steps(int):
-            save_checkpoint_steps(int):
-        Return:
-            None
-        """
-        logger.info("Start training...")
+    def _accum_count(self, step):
+        for i in range(len(self.accum_steps)):
+            if step > self.accum_steps[i]:
+                _accum = self.accum_count_l[i]
+        return _accum
 
-        step = self.optim._step + 1
-        true_batchs = []
-        accum = 0
+    def _maybe_update_dropout(self, step):
+        for i in range(len(self.dropout_steps)):
+            if step > 1 and step == self.dropout_steps[i] + 1:
+                self.model.update_dropout(self.dropout[i])
+                logger.info(
+                    "Updated dropout to %f from step %d" % (self.dropout[i], step)
+                )
+
+    def _accum_batches(self, iterator):
+        batches = []
         normalization = 0
-        train_iter = train_iter_fct()
+        self.accum_count = self._accum_count(self.optim.training_step)
+        for batch in iterator:
+            batches.append(batch)
+            if self.norm_method == "tokens":
+                num_tokens = batch.tgt[1:, :, 0].ne(self.train_loss.padding_idx).sum()
+                normalization += num_tokens.item()
+            else:
+                normalization += batch.batch_size
+            if len(batches) == self.accum_count:
+                yield batches, normalization
+                self.accum_count = self._accum_count(self.optim.training_step)
+                batches = []
+                normalization = 0
+        if batches:
+            yield batches, normalization
+
+    def _update_average(self, step):
+        if self.moving_average is None:
+            copy_params = [
+                params.detach().float() for params in self.model.parameters()
+            ]
+            self.moving_average = copy_params
+        else:
+            average_decay = max(self.average_decay, 1 - (step + 1) / (step + 10))
+            for (i, avg), cpt in zip(
+                enumerate(self.moving_average), self.model.parameters()
+            ):
+                self.moving_average[i] = (
+                    1 - average_decay
+                ) * avg + cpt.detach().float() * average_decay
+
+    def train(
+        self,
+        train_iter,
+        train_steps,
+        save_checkpoint_steps=5000,
+        valid_iter=None,
+        valid_steps=10000,
+    ):
+        """
+        The main training loop by iterating over `train_iter` and possibly
+        running validation on `valid_iter`.
+
+        Args:
+            train_iter: A generator that returns the next training batch.
+            train_steps: Run training for this many iterations.
+            save_checkpoint_steps: Save a checkpoint every this many
+              iterations.
+            valid_iter: A generator that returns the next validation batch.
+            valid_steps: Run evaluation every this many iterations.
+
+        Returns:
+            The gathered statistics.
+        """
+        if valid_iter is None:
+            logger.info("Start training loop without validation...")
+        else:
+            logger.info(
+                "Start training loop and validate every %d steps...", valid_steps
+            )
 
         total_stats = Statistics()
         report_stats = Statistics()
         self._start_report_manager(start_time=total_stats.start_time)
 
-        while step <= train_steps:
+        for i, (batches, normalization) in enumerate(self._accum_batches(train_iter)):
+            step = self.optim.training_step
+            # UPDATE DROPOUT
+            self._maybe_update_dropout(step)
 
-            reduce_counter = 0
-            for i, batch in enumerate(train_iter):
-                if self.n_gpu == 0 or (i % self.n_gpu == self.gpu_rank):
-                    if self.gpu_verbose_level > 1:
-                        logger.info(
-                            "GpuRank %d: index: %d accum: %d"
-                            % (self.gpu_rank, i, accum)
-                        )
-
-                    true_batchs.append(batch)
-
-                    if self.norm_method == "tokens":
-                        num_tokens = batch.tgt[1:].ne(self.train_loss.padding_idx).sum()
-                        normalization += num_tokens.item()
-                    else:
-                        normalization += batch.batch_size
-                    accum += 1
-                    if accum == self.grad_accum_count:
-                        reduce_counter += 1
-                        if self.gpu_verbose_level > 0:
-                            logger.info(
-                                "GpuRank %d: reduce_counter: %d \
-                                        n_minibatch %d"
-                                % (self.gpu_rank, reduce_counter, len(true_batchs))
-                            )
-                        if self.n_gpu > 1:
-                            normalization = sum(all_gather_list(normalization))
-
-                        self._gradient_accumulation(
-                            true_batchs, normalization, total_stats, report_stats
-                        )
-
-                        report_stats = self._maybe_report_training(
-                            step, train_steps, self.optim.learning_rate, report_stats
-                        )
-
-                        true_batchs = []
-                        accum = 0
-                        normalization = 0
-                        if step % valid_steps == 0:
-                            if self.gpu_verbose_level > 0:
-                                logger.info(
-                                    "GpuRank %d: validate step %d"
-                                    % (self.gpu_rank, step)
-                                )
-                            valid_iter = valid_iter_fct()
-                            valid_stats = self.validate(valid_iter)
-                            if self.gpu_verbose_level > 0:
-                                logger.info(
-                                    "GpuRank %d: gather valid stat \
-                                            step %d"
-                                    % (self.gpu_rank, step)
-                                )
-                            valid_stats = self._maybe_gather_stats(valid_stats)
-                            if self.gpu_verbose_level > 0:
-                                logger.info(
-                                    "GpuRank %d: report stat step %d"
-                                    % (self.gpu_rank, step)
-                                )
-                            self._report_step(
-                                self.optim.learning_rate, step, valid_stats=valid_stats
-                            )
-
-                        if self.gpu_rank == 0:
-                            self._maybe_save(step)
-                        step += 1
-                        if step > train_steps:
-                            break
+            if self.gpu_verbose_level > 1:
+                logger.info("GpuRank %d: index: %d", self.gpu_rank, i)
             if self.gpu_verbose_level > 0:
                 logger.info(
-                    "GpuRank %d: we completed an epoch \
-                            at step %d"
-                    % (self.gpu_rank, step)
+                    "GpuRank %d: reduce_counter: %d \
+                            n_minibatch %d"
+                    % (self.gpu_rank, i + 1, len(batches))
                 )
-            train_iter = train_iter_fct()
 
+
+            self._gradient_accumulation(
+                batches, normalization, total_stats, report_stats
+            )
+
+            if self.average_decay > 0 and i % self.average_every == 0:
+                self._update_average(step)
+
+            report_stats = self._maybe_report_training(
+                step, train_steps, self.optim.learning_rate(), report_stats
+            )
+
+            if valid_iter is not None and step % valid_steps == 0:
+                if self.gpu_verbose_level > 0:
+                    logger.info("GpuRank %d: validate step %d" % (self.gpu_rank, step))
+                valid_stats = self.validate(
+                    valid_iter, moving_average=self.moving_average
+                )
+                if self.gpu_verbose_level > 0:
+                    logger.info(
+                        "GpuRank %d: gather valid stat \
+                                step %d"
+                        % (self.gpu_rank, step)
+                    )
+                valid_stats = self._maybe_gather_stats(valid_stats)
+                if self.gpu_verbose_level > 0:
+                    logger.info(
+                        "GpuRank %d: report stat step %d" % (self.gpu_rank, step)
+                    )
+                self._report_step(
+                    self.optim.learning_rate(), step, valid_stats=valid_stats
+                )
+                # Run patience mechanism
+                if self.earlystopper is not None:
+                    self.earlystopper(valid_stats, step)
+                    # If the patience has reached the limit, stop training
+                    if self.earlystopper.has_stopped():
+                        break
+
+            if self.model_saver is not None and (
+                save_checkpoint_steps != 0 and step % save_checkpoint_steps == 0
+            ):
+                self.model_saver.save(step, moving_average=self.moving_average)
+
+            if train_steps > 0 and step >= train_steps:
+                break
+
+        if self.model_saver is not None:
+            self.model_saver.save(step, moving_average=self.moving_average)
         return total_stats
 
-    def validate(self, valid_iter):
+    def validate(self, valid_iter, moving_average=None):
         """ Validate model.
             valid_iter: validate data iterator
         Returns:
             :obj:`nmt.Statistics`: validation loss statistics
         """
+        valid_model = self.model
+        if moving_average:
+            # swap model params w/ moving average
+            # (and keep the original parameters)
+            model_params_data = []
+            for avg, param in zip(self.moving_average, valid_model.parameters()):
+                model_params_data.append(param.data)
+                param.data = (
+                    avg.data.half() if self.optim._fp16 == "legacy" else avg.data
+                )
+
         # Set model in validating mode.
-        self.model.eval()
+        valid_model.eval()
 
-        stats = Statistics()
+        with torch.no_grad():
+            stats = Statistics()
 
-        for batch in valid_iter:
-            src = make_features(batch, "src", self.data_type)
-            if self.data_type == "text":
-                _, src_lengths = batch.src
-            elif self.data_type == "audio":
-                src_lengths = batch.src_lengths
-            else:
-                src_lengths = None
+            for batch in valid_iter:
+                src, src_lengths = (
+                    batch.src if isinstance(batch.src, tuple) else (batch.src, None)
+                )
+                tgt = batch.tgt
 
-            tgt = make_features(batch, "tgt")
+                with torch.cuda.amp.autocast(enabled=self.optim.amp):
+                    # F-prop through the model.
+                    outputs, attns = valid_model(
+                        src, tgt, src_lengths
+                    )
 
-            # F-prop through the model.
-            outputs, attns, _ = self.model(src, tgt, src_lengths)
+                    # Compute loss.
+                    _, batch_stats = self.valid_loss(batch, outputs, attns)
 
-            # Compute loss.
-            batch_stats = self.valid_loss.monolithic_compute_loss(batch, outputs, attns)
-
-            # Update statistics.
-            stats.update(batch_stats)
+                # Update statistics.
+                stats.update(batch_stats)
+        if moving_average:
+            for param_data, param in zip(model_params_data, self.model.parameters()):
+                param.data = param_data
 
         # Set model back to training mode.
-        self.model.train()
+        valid_model.train()
 
         return stats
 
     def _gradient_accumulation(
-        self, true_batchs, normalization, total_stats, report_stats
+        self, true_batches, normalization, total_stats, report_stats
     ):
-        if self.grad_accum_count > 1:
-            self.model.zero_grad()
+        if self.accum_count > 1:
+            self.optim.zero_grad()
 
-        for batch in true_batchs:
+        for k, batch in enumerate(true_batches):
             target_size = batch.tgt.size(0)
             # Truncated BPTT: reminder not compatible with accum > 1
             if self.trunc_size:
@@ -255,60 +510,71 @@ class Trainer(object):
             else:
                 trunc_size = target_size
 
-            dec_state = None
-            src = make_features(batch, "src", self.data_type)
-            if self.data_type == "text":
-                _, src_lengths = batch.src
+            batch = self.maybe_noise_source(batch)
+
+            src, src_lengths = (
+                batch.src if isinstance(batch.src, tuple) else (batch.src, None)
+            )
+            if src_lengths is not None:
                 report_stats.n_src_words += src_lengths.sum().item()
-            elif self.data_type == "audio":
-                src_lengths = batch.src_lengths
-            else:
-                src_lengths = None
 
-            tgt_outer = make_features(batch, "tgt")
+            tgt_outer = batch.tgt
 
+            bptt = False
             for j in range(0, target_size - 1, trunc_size):
                 # 1. Create truncated target.
                 tgt = tgt_outer[j : j + trunc_size]
 
                 # 2. F-prop all but generator.
-                if self.grad_accum_count == 1:
-                    self.model.zero_grad()
-                outputs, attns, dec_state = self.model(src, tgt, src_lengths, dec_state)
+                if self.accum_count == 1:
+                    self.optim.zero_grad()
 
-                # 3. Compute loss in shards for memory efficiency.
-                batch_stats = self.train_loss.sharded_compute_loss(
-                    batch, outputs, attns, j, trunc_size, self.shard_size, normalization
-                )
-                total_stats.update(batch_stats)
-                report_stats.update(batch_stats)
+                with torch.cuda.amp.autocast(enabled=self.optim.amp):
+                    outputs, attns = self.model(
+                        src, tgt, src_lengths, bptt=bptt
+                    )
+                    bptt = True
+
+                    # 3. Compute loss.
+                    loss, batch_stats = self.train_loss(
+                        batch,
+                        outputs,
+                        attns,
+                        normalization=normalization,
+                        shard_size=self.shard_size,
+                        trunc_start=j,
+                        trunc_size=trunc_size,
+                    )
+
+                try:
+                    if loss is not None:
+                        self.optim.backward(loss)
+
+                    total_stats.update(batch_stats)
+                    report_stats.update(batch_stats)
+
+                except Exception:
+                    traceback.print_exc()
+                    logger.info(
+                        "At step %d, we removed a batch - accum %d",
+                        self.optim.training_step,
+                        k,
+                    )
 
                 # 4. Update the parameters and statistics.
-                if self.grad_accum_count == 1:
-                    # Multi GPU gradient gather
-                    if self.n_gpu > 1:
-                        grads = [
-                            p.grad.data
-                            for p in self.model.parameters()
-                            if p.requires_grad and p.grad is not None
-                        ]
-                        all_reduce_and_rescale_tensors(grads, float(1))
+                if self.accum_count == 1:
                     self.optim.step()
 
                 # If truncated, don't backprop fully.
-                if dec_state is not None:
-                    dec_state.detach()
+                # TO CHECK
+                # if dec_state is not None:
+                #    dec_state.detach()
+                if self.model.decoder.state is not None:
+                    self.model.decoder.detach_state()
 
         # in case of multi step gradient accumulation,
         # update only after accum batches
-        if self.grad_accum_count > 1:
-            if self.n_gpu > 1:
-                grads = [
-                    p.grad.data
-                    for p in self.model.parameters()
-                    if p.requires_grad and p.grad is not None
-                ]
-                all_reduce_and_rescale_tensors(grads, float(1))
+        if self.accum_count > 1:
             self.optim.step()
 
     def _start_report_manager(self, start_time=None):
@@ -324,6 +590,13 @@ class Trainer(object):
     def _maybe_gather_stats(self, stat):
         """
         Gather statistics in multi-processes cases
+
+        Args:
+            stat(:obj:Statistics): a Statistics object to gather
+                or None (it returns None in this case)
+
+        Returns:
+            stat: the updated (or unchanged) stat object
         """
         if stat is not None and self.n_gpu > 1:
             return Statistics.all_gather_stats(stat)
@@ -332,27 +605,40 @@ class Trainer(object):
     def _maybe_report_training(self, step, num_steps, learning_rate, report_stats):
         """
         Simple function to report training stats (if report_manager is set)
+        see `ReportManager.report_training` for doc
         """
         if self.report_manager is not None:
             return self.report_manager.report_training(
-                step, num_steps, learning_rate, report_stats, multigpu=self.n_gpu > 1
+                step,
+                num_steps,
+                learning_rate,
+                None
+                if self.earlystopper is None
+                else self.earlystopper.current_tolerance,
+                report_stats,
+                multigpu=self.n_gpu > 1,
             )
 
     def _report_step(self, learning_rate, step, train_stats=None, valid_stats=None):
         """
         Simple function to report stats (if report_manager is set)
+        see `ReportManager.report_step` for doc
         """
         if self.report_manager is not None:
             return self.report_manager.report_step(
-                learning_rate, step, train_stats=train_stats, valid_stats=valid_stats
+                learning_rate,
+                None
+                if self.earlystopper is None
+                else self.earlystopper.current_tolerance,
+                step,
+                train_stats=train_stats,
+                valid_stats=valid_stats,
             )
 
-    def _maybe_save(self, step):
-        """
-        Save the model if a model saver is set
-        """
-        if self.model_saver is not None:
-            self.model_saver.maybe_save(step)
+    def maybe_noise_source(self, batch):
+        if self.source_noise is not None:
+            return self.source_noise(batch)
+        return batch
 
 
 def check_save_model_path(opt):
@@ -363,146 +649,83 @@ def check_save_model_path(opt):
 
 
 def tally_parameters(model):
-    n_params = sum([p.nelement() for p in model.parameters()])
     enc = 0
     dec = 0
     for name, param in model.named_parameters():
         if "encoder" in name:
             enc += param.nelement()
-        elif "decoder" or "generator" in name:
+        else:
             dec += param.nelement()
-    return n_params, enc, dec
+    return enc + dec, enc, dec
 
 
-def training_opt_postprocessing(opt, device_id):
-    if opt.word_vec_size != -1:
-        opt.src_word_vec_size = opt.word_vec_size
-        opt.tgt_word_vec_size = opt.word_vec_size
+def configure_process(opt, device_id):
 
-    if opt.layers != -1:
-        opt.enc_layers = opt.layers
-        opt.dec_layers = opt.layers
+    use_gpu = isinstance(opt.gpu_ranks, list) and len(opt.gpu_ranks) > 0 
 
-    if opt.rnn_size != -1:
-        opt.enc_rnn_size = opt.rnn_size
-        opt.dec_rnn_size = opt.rnn_size
-        if opt.model_type == "text" and opt.enc_rnn_size != opt.dec_rnn_size:
-            raise AssertionError(
-                """We do not support different encoder and
-                decoder rnn sizes for translation now."""
-            )
+    if use_gpu and device_id >= 0:
+        torch.cuda.set_device(device_id)
+        device = torch.device("cuda", device_id)
+    elif use_gpu:
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    
+    opt.device = device
 
-    opt.brnn = opt.encoder_type == "brnn"
-
-    if opt.rnn_type == "SRU" and not opt.gpu_ranks:
-        raise AssertionError("Using SRU requires -gpu_ranks set.")
-
-    if torch.cuda.is_available() and not opt.gpu_ranks:
-        logger.info(
-            "WARNING: You have a CUDA device, \
-             should run with -gpu_ranks"
-        )
-
+    """Sets the random seed."""
     if opt.seed > 0:
-        torch.manual_seed(opt.seed)
-        # this one is needed for torchtext random call (shuffled iterator)
-        # in multi gpu it ensures datasets are read in the same order
-        random.seed(opt.seed)
-        # some cudnn methods can be random even after fixing the seed
-        # unless you tell it to be deterministic
+        torch.manual_seed(seed)
+        random.seed(seed)
         torch.backends.cudnn.deterministic = True
 
-    if device_id >= 0:
-        torch.cuda.set_device(device_id)
-        if opt.seed > 0:
-            # These ensure same initialization in multi gpu mode
-            torch.cuda.manual_seed(opt.seed)
+    if use_gpu and opt.seed > 0:
+        torch.cuda.manual_seed(seed)
 
-    return opt
 
-def build_loss_compute(model, tgt_vocab, opt, train=True):
-    device = torch.device("cuda" if use_gpu(opt) else "cpu")
-    compute = NMTLossCompute(
-        model.generator,
-        tgt_vocab,
-        label_smoothing=opt.label_smoothing if train else 0.0,
-    )
-    compute.to(device)
+def main(opt, device_id):
+    configure_process(opt, device_id)
 
-    return compute
-
-def build_trainer(opt, device_id, model, fields, optim, data_type, model_saver=None):
-    """
-    Simplify `Trainer` creation based on user `opt`s*
-    """
-
-    train_loss = build_loss_compute(model, fields["tgt"].vocab, opt)
-    valid_loss = build_loss_compute(model, fields["tgt"].vocab, opt, train=False)
-
-    trunc_size = opt.truncated_decoder  # Badly named...
-    shard_size = opt.max_generator_batches
-    norm_method = opt.normalization
-    grad_accum_count = opt.accum_count
-    n_gpu = opt.world_size
-    if device_id >= 0:
-        gpu_rank = opt.gpu_ranks[device_id]
-    else:
-        gpu_rank = 0
-        n_gpu = 0
-    gpu_verbose_level = opt.gpu_verbose_level
-
-    report_manager = ReportMgr(opt.report_every, start_time=-1)
-    
-    trainer = Trainer(
-        model,
-        train_loss,
-        valid_loss,
-        optim,
-        trunc_size,
-        shard_size,
-        data_type,
-        norm_method,
-        grad_accum_count,
-        n_gpu,
-        gpu_rank,
-        gpu_verbose_level,
-        report_manager,
-        model_saver=model_saver,
-    )
-    return trainer
-
-def train_on_single_device(opt, device_id):
-    opt = training_opt_postprocessing(opt, device_id)
     init_logger(opt.log_file)
-    # Load checkpoint if we resume from a previous training.
+
+    assert len(opt.accum_count) == len(opt.accum_steps), "Number of accum_count values must match number of accum_steps"
+
     if opt.train_from:
         logger.info("Loading checkpoint from %s" % opt.train_from)
         checkpoint = torch.load(
             opt.train_from, map_location=lambda storage, loc: storage
         )
-        model_opt = checkpoint["opt"]
+        model_opt = ArgumentParser.ckpt_model_opts(checkpoint["opt"])
+        ArgumentParser.update_model_opts(model_opt)
+        ArgumentParser.validate_model_opts(model_opt)
+        logger.info("Loading vocab from checkpoint at %s." % opt.train_from)
+        vocab = checkpoint["vocab"]
     else:
         checkpoint = None
         model_opt = opt
+        vocab = torch.load(opt.data + ".vocab.pt")
 
-    # Peek the first dataset to determine the data_type.
-    # (All datasets have the same data_type).
-    first_dataset = next(lazily_load_dataset("train", opt))
-    data_type = first_dataset.data_type
+    fields = vocab
 
-    # Load fields generated from preprocess phase.
-    fields = _load_fields(first_dataset, data_type, opt, checkpoint)
+    # patch for fields that may be missing in old data/model
+    dvocab = torch.load(opt.data + ".vocab.pt")
+    maybe_cid_field = dvocab.get("corpus_id", None)
+    if maybe_cid_field is not None:
+        fields.update({"corpus_id": maybe_cid_field})
 
-    # Report src/tgt features.
-
-    src_features, tgt_features = _collect_report_features(fields)
-    for j, feat in enumerate(src_features):
-        logger.info(" * src feature %d size = %d" % (j, len(fields[feat].vocab)))
-    for j, feat in enumerate(tgt_features):
-        logger.info(" * tgt feature %d size = %d" % (j, len(fields[feat].vocab)))
+    # Report src and tgt vocab sizes, including for features
+    for side in ["src", "tgt"]:
+        f = fields[side]
+        try:
+            f_iter = iter(f)
+        except TypeError:
+            f_iter = [(side, f)]
+        for sn, sf in f_iter:
+            if sf.use_vocab:
+                logger.info(" * %s vocab size = %d" % (sn, len(sf.vocab)))
 
     # Build model.
-    model = build_model(opt, fields["tgt"].vocab, checkpoint, gpu=use_gpu(opt))
+    model = build_model(model_opt, opt, fields, checkpoint)
     n_params, enc, dec = tally_parameters(model)
     logger.info("encoder: %d" % enc)
     logger.info("decoder: %d" % dec)
@@ -510,123 +733,48 @@ def train_on_single_device(opt, device_id):
     check_save_model_path(opt)
 
     # Build optimizer.
-    optim = build_optim(model, opt, checkpoint)
+    optim = Optimizer.from_opt(model, opt, checkpoint=checkpoint)
 
     # Build model saver
     model_saver = ModelSaver(
-        opt.save_model,
-        model,
-        model_opt,
-        fields,
-        optim,
-        opt.save_checkpoint_steps,
-        opt.keep_checkpoint,
+        opt.save_model, model, model_opt, fields, optim, opt.keep_checkpoint
     )
 
     trainer = build_trainer(
-        opt, device_id, model, fields, optim, data_type, model_saver=model_saver
+        opt, device_id, model, fields, optim, model_saver=model_saver
     )
 
-    def train_iter_fct():
-        return build_dataset_iter(lazily_load_dataset("train", opt), fields, opt)
+ 
+    train_iter = DatasetIterator("train", fields, opt)
+    train_iter = IterOnDevice(train_iter, device_id)
+  
 
-    def valid_iter_fct():
-        return build_dataset_iter(
-            lazily_load_dataset("valid", opt), fields, opt, is_train=False
-        )
+    valid_iter = DatasetIterator("valid", fields, opt, is_train=False)
+    if valid_iter is not None:
+        valid_iter = IterOnDevice(valid_iter, device_id)
 
-    # Do training.
-    trainer.train(train_iter_fct, valid_iter_fct, opt.train_steps, opt.valid_steps)
+    if len(opt.gpu_ranks):
+        logger.info("Starting training on GPU: %s" % opt.gpu_ranks)
+    else:
+        logger.info("Starting training on CPU, could be very slow")
 
-    if opt.tensorboard:
-        trainer.report_manager.tensorboard_writer.close()
+    train_steps = opt.train_steps
+    if opt.single_pass and train_steps > 0:
+        logger.warning("Option single_pass is enabled, ignoring train_steps.")
+        train_steps = 0
 
-
-def main(opt):
-    n_gpu = len(opt.gpu_ranks)
-
-    if opt.world_size > 1:
-        mp = torch.multiprocessing.get_context("spawn")
-        # Create a thread to listen for errors in the child processes.
-        error_queue = mp.SimpleQueue()
-        error_handler = ErrorHandler(error_queue)
-        # Train with multiprocessing.
-        procs = []
-        for device_id in range(n_gpu):
-            procs.append(
-                mp.Process(target=run, args=(opt, device_id, error_queue,), daemon=True)
-            )
-            procs[device_id].start()
-            logger.info(" Starting process pid: %d  " % procs[device_id].pid)
-            error_handler.add_child(procs[device_id].pid)
-        for p in procs:
-            p.join()
-
-    elif n_gpu == 1:  # case 1 GPU only
-        train_on_single_device(opt, opt.gpuid[0])
-    else:  # case only CPU
-        train_on_single_device(opt, -1)
-
-
-def run(opt, device_id, error_queue):
-    """ run process """
-    try:
-        gpu_rank = multi_init(opt, device_id)
-        if gpu_rank != opt.gpu_ranks[device_id]:
-            raise AssertionError(
-                "An error occurred in \
-                  Distributed initialization"
-            )
-        train_on_single_device(opt, device_id)
-    except KeyboardInterrupt:
-        pass  # killed by parent, do nothing
-    except Exception:
-        # propagate exception to parent process, keeping original traceback
-        import traceback
-
-        error_queue.put((opt.gpu_ranks[device_id], traceback.format_exc()))
-
-
-class ErrorHandler(object):
-    """A class that listens for exceptions in children processes and propagates
-    the tracebacks to the parent process."""
-
-    def __init__(self, error_queue):
-        """ init error handler """
-        import signal
-        import threading
-
-        self.error_queue = error_queue
-        self.children_pids = []
-        self.error_thread = threading.Thread(target=self.error_listener, daemon=True)
-        self.error_thread.start()
-        signal.signal(signal.SIGUSR1, self.signal_handler)
-
-    def add_child(self, pid):
-        """ error handler """
-        self.children_pids.append(pid)
-
-    def error_listener(self):
-        """ error listener """
-        (rank, original_trace) = self.error_queue.get()
-        self.error_queue.put((rank, original_trace))
-        os.kill(os.getpid(), signal.SIGUSR1)
-
-    def signal_handler(self, signalnum, stackframe):
-        """ signal handler """
-        for pid in self.children_pids:
-            os.kill(pid, signal.SIGINT)  # kill children processes
-        (rank, original_trace) = self.error_queue.get()
-        msg = """\n\n-- Tracebacks above this line can probably be ignored --\n\n"""
-        msg += original_trace
-        raise Exception(msg)
+    trainer.train(
+        train_iter,
+        train_steps,
+        save_checkpoint_steps=opt.save_checkpoint_steps,
+        valid_iter=valid_iter,
+        valid_steps=opt.valid_steps,
+    )
 
 
 if __name__ == "__main__":
-    from argparse import Namespace
-
-    params = {}
-    with open("params.json", "r") as f:
-        params = json.loads(f.read())
-    opt = Namespace(**params)
-    main(opt)
+    opt = {}
+    with open("opts_training.json", "r") as f:
+        opt = json.loads(f.read())
+    opt = Namespace(**opt)
+    main(opt, 0)

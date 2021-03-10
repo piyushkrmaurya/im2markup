@@ -121,7 +121,7 @@ def translate(img, model, vocab, n_best=3, beam_size=5, max_length=150):
 
 def generate_latex(img):
     # def load_test_model(opt, dummy_opt, model_path=None):
-    model_path = "checkpoint.pt"
+    model_path = "model_5000.pt"
     checkpoint = torch.load(model_path, map_location=lambda storage, loc: storage)
 
     # del checkpoint["optim"]
