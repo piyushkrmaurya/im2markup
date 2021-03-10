@@ -359,7 +359,7 @@ class DatasetIterator:
         self.device = "cpu"
         self.is_train = is_train
         self.repeat = not opt.single_pass
-        self.num_batches_multiple = max(opt.accum_count) * opt.world_size
+        self.num_batches_multiple = max(opt.accum_count)
         self.yield_raw_example = multi
         self.pool_factor = opt.pool_factor
 

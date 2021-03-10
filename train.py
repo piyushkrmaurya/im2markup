@@ -9,7 +9,6 @@ import traceback
 import warnings
 from argparse import Namespace
 from collections import deque
-from copy import copy, deepcopy
 
 import torch
 import torch.nn as nn
@@ -18,8 +17,7 @@ from torch.nn.init import xavier_uniform_
 
 from dataset import DatasetIterator, IterOnDevice
 from loss import NMTLossCompute
-from models import (Cast, Embeddings, ImageEncoder, InputFeedRNNDecoder,
-                    NMTModel)
+from models import Cast, Embeddings, ImageEncoder, InputFeedRNNDecoder, NMTModel
 from optimizer import Optimizer
 from utils import ModelSaver, ReportManager, Statistics
 
@@ -58,7 +56,6 @@ def build_model(model_opt, opt, fields, checkpoint):
     except AttributeError:
         model_opt.attention_dropout = model_opt.dropout
 
-
     # Build encoder.
     encoder = ImageEncoder.from_opt(model_opt)
 
@@ -71,11 +68,10 @@ def build_model(model_opt, opt, fields, checkpoint):
     model = NMTModel(encoder, decoder)
 
     # Build Generator.
-    gen_func = nn.LogSoftmax(dim=-1)
     generator = nn.Sequential(
         nn.Linear(model_opt.dec_rnn_size, len(fields["tgt"].base_field.vocab)),
         Cast(torch.float32),
-        gen_func,
+        nn.LogSoftmax(dim=-1),
     )
     if model_opt.share_decoder_embeddings:
         generator[0].weight = decoder.embeddings.word_lut.weight
@@ -125,7 +121,7 @@ def build_model(model_opt, opt, fields, checkpoint):
     return model
 
 
-def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
+def build_trainer(opt, gpu_id, model, fields, optim, model_saver=None):
     """
     Simplify `Trainer` creation based on user `opt`s*
 
@@ -142,29 +138,27 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
 
     tgt_field = dict(fields)["tgt"].base_field
     train_loss = NMTLossCompute.from_opt(model, tgt_field, opt, device=opt.device)
-    valid_loss = NMTLossCompute.from_opt(model, tgt_field, opt, train=False, device=opt.device)
+    valid_loss = NMTLossCompute.from_opt(
+        model, tgt_field, opt, train=False, device=opt.device
+    )
 
     trunc_size = opt.truncated_decoder  # Badly named...
     shard_size = opt.max_generator_batches if opt.model_dtype == "fp32" else 0
     norm_method = opt.normalization
     accum_count = opt.accum_count
     accum_steps = opt.accum_steps
-    n_gpu = opt.world_size
     average_decay = opt.average_decay
     average_every = opt.average_every
     dropout = opt.dropout
     dropout_steps = opt.dropout_steps
-    if device_id >= 0:
-        gpu_rank = opt.gpu_ranks[device_id]
+    if gpu_id >= 0:
+        n_gpu = 1
     else:
-        gpu_rank = 0
         n_gpu = 0
     gpu_verbose_level = opt.gpu_verbose_level
 
     earlystopper = (
-        EarlyStopping(
-            opt.early_stopping, scorers=scorers_from_opts(opt)
-        )
+        EarlyStopping(opt.early_stopping, scorers=scorers_from_opts(opt))
         if opt.early_stopping > 0
         else None
     )
@@ -184,7 +178,7 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
             pad_idx=src_field.pad_token,
             end_of_sentence_mask=src_field.end_of_sentence_mask,
             word_start_mask=src_field.word_start_mask,
-            device_id=device_id,
+            gpu_id=gpu_id,
         )
 
     report_manager = ReportManager(opt.report_every, start_time=-1)
@@ -199,10 +193,10 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
         accum_count,
         accum_steps,
         n_gpu,
-        gpu_rank,
+        gpu_id,
         gpu_verbose_level,
         report_manager,
-        model_saver=model_saver if gpu_rank == 0 else None,
+        model_saver=model_saver,
         average_decay=average_decay,
         average_every=average_every,
         model_dtype=opt.model_dtype,
@@ -252,7 +246,7 @@ class Trainer(object):
         accum_count=[1],
         accum_steps=[0],
         n_gpu=1,
-        gpu_rank=1,
+        gpu_id=0,
         gpu_verbose_level=0,
         report_manager=None,
         model_saver=None,
@@ -276,7 +270,7 @@ class Trainer(object):
         self.accum_count = accum_count[0]
         self.accum_steps = accum_steps
         self.n_gpu = n_gpu
-        self.gpu_rank = gpu_rank
+        self.gpu_id = gpu_id
         self.gpu_verbose_level = gpu_verbose_level
         self.report_manager = report_manager
         self.model_saver = model_saver
@@ -375,7 +369,7 @@ class Trainer(object):
             logger.info("Start training loop without validation...")
         else:
             logger.info(
-                "Start training loop and validate every %d steps...", valid_steps
+                "Start training loop and validate every %d steps..." % valid_steps
             )
 
         total_stats = Statistics()
@@ -388,14 +382,12 @@ class Trainer(object):
             self._maybe_update_dropout(step)
 
             if self.gpu_verbose_level > 1:
-                logger.info("GpuRank %d: index: %d", self.gpu_rank, i)
+                logger.info("GPU Id %d: index: %d" % self.gpu_id, i)
             if self.gpu_verbose_level > 0:
                 logger.info(
-                    "GpuRank %d: reduce_counter: %d \
-                            n_minibatch %d"
-                    % (self.gpu_rank, i + 1, len(batches))
+                    "GPU ID %d: reduce_counter: %d n_minibatch %d"
+                    % (self.gpu_id, i + 1, len(batches))
                 )
-
 
             self._gradient_accumulation(
                 batches, normalization, total_stats, report_stats
@@ -410,20 +402,18 @@ class Trainer(object):
 
             if valid_iter is not None and step % valid_steps == 0:
                 if self.gpu_verbose_level > 0:
-                    logger.info("GpuRank %d: validate step %d" % (self.gpu_rank, step))
+                    logger.info("GPU Id %d: validate step %d" % (self.gpu_id, step))
                 valid_stats = self.validate(
                     valid_iter, moving_average=self.moving_average
                 )
                 if self.gpu_verbose_level > 0:
                     logger.info(
-                        "GpuRank %d: gather valid stat \
-                                step %d"
-                        % (self.gpu_rank, step)
+                        "GPU Id %d: gather valid stat step %d" % (self.gpu_id, step)
                     )
                 valid_stats = self._maybe_gather_stats(valid_stats)
                 if self.gpu_verbose_level > 0:
                     logger.info(
-                        "GpuRank %d: report stat step %d" % (self.gpu_rank, step)
+                        "GPU Id %d: report stat step %d" % (self.gpu_id, step)
                     )
                 self._report_step(
                     self.optim.learning_rate(), step, valid_stats=valid_stats
@@ -448,7 +438,7 @@ class Trainer(object):
         return total_stats
 
     def validate(self, valid_iter, moving_average=None):
-        """ Validate model.
+        """Validate model.
             valid_iter: validate data iterator
         Returns:
             :obj:`nmt.Statistics`: validation loss statistics
@@ -478,9 +468,7 @@ class Trainer(object):
 
                 with torch.cuda.amp.autocast(enabled=self.optim.amp):
                     # F-prop through the model.
-                    outputs, attns = valid_model(
-                        src, tgt, src_lengths
-                    )
+                    outputs, attns = valid_model(src, tgt, src_lengths)
 
                     # Compute loss.
                     _, batch_stats = self.valid_loss(batch, outputs, attns)
@@ -530,9 +518,7 @@ class Trainer(object):
                     self.optim.zero_grad()
 
                 with torch.cuda.amp.autocast(enabled=self.optim.amp):
-                    outputs, attns = self.model(
-                        src, tgt, src_lengths, bptt=bptt
-                    )
+                    outputs, attns = self.model(src, tgt, src_lengths, bptt=bptt)
                     bptt = True
 
                     # 3. Compute loss.
@@ -556,9 +542,8 @@ class Trainer(object):
                 except Exception:
                     traceback.print_exc()
                     logger.info(
-                        "At step %d, we removed a batch - accum %d",
-                        self.optim.training_step,
-                        k,
+                        "At step %d, we removed a batch - accum %d"
+                        % (self.optim.training_step, k)
                     )
 
                 # 4. Update the parameters and statistics.
@@ -659,36 +644,33 @@ def tally_parameters(model):
     return enc + dec, enc, dec
 
 
-def configure_process(opt, device_id):
+def configure_device(opt):
 
-    use_gpu = isinstance(opt.gpu_ranks, list) and len(opt.gpu_ranks) > 0 
-
-    if use_gpu and device_id >= 0:
-        torch.cuda.set_device(device_id)
-        device = torch.device("cuda", device_id)
-    elif use_gpu:
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    
-    opt.device = device
-
-    """Sets the random seed."""
     if opt.seed > 0:
-        torch.manual_seed(seed)
-        random.seed(seed)
+        torch.manual_seed(opt.seed)
+        random.seed(opt.seed)
         torch.backends.cudnn.deterministic = True
 
-    if use_gpu and opt.seed > 0:
-        torch.cuda.manual_seed(seed)
+    if opt.device == "cuda":
+        if opt.gpu_id >= 0:
+            torch.cuda.set_device(opt.gpu_id)
+            opt.device = torch.device(opt.device, opt.gpu_id)
+        else:
+            opt.device = torch.device(opt.device)
+        if opt.seed > 0:
+            torch.cuda.manual_seed(opt.seed)
+    else:
+        opt.device = torch.device("cpu")
 
 
-def main(opt, device_id):
-    configure_process(opt, device_id)
+def main(opt):
+    configure_device(opt)
 
     init_logger(opt.log_file)
 
-    assert len(opt.accum_count) == len(opt.accum_steps), "Number of accum_count values must match number of accum_steps"
+    assert len(opt.accum_count) == len(
+        opt.accum_steps
+    ), "Number of accum_count values must match number of accum_steps"
 
     if opt.train_from:
         logger.info("Loading checkpoint from %s" % opt.train_from)
@@ -741,20 +723,18 @@ def main(opt, device_id):
     )
 
     trainer = build_trainer(
-        opt, device_id, model, fields, optim, model_saver=model_saver
+        opt, opt.gpu_id, model, fields, optim, model_saver=model_saver
     )
 
- 
     train_iter = DatasetIterator("train", fields, opt)
-    train_iter = IterOnDevice(train_iter, device_id)
-  
+    train_iter = IterOnDevice(train_iter, opt.gpu_id)
 
     valid_iter = DatasetIterator("valid", fields, opt, is_train=False)
     if valid_iter is not None:
-        valid_iter = IterOnDevice(valid_iter, device_id)
+        valid_iter = IterOnDevice(valid_iter, opt.gpu_id)
 
-    if len(opt.gpu_ranks):
-        logger.info("Starting training on GPU: %s" % opt.gpu_ranks)
+    if opt.gpu_id >= 0:
+        logger.info("Starting training on GPU: %s" % opt.gpu_id)
     else:
         logger.info("Starting training on CPU, could be very slow")
 
@@ -774,7 +754,10 @@ def main(opt, device_id):
 
 if __name__ == "__main__":
     opt = {}
+
     with open("opts_training.json", "r") as f:
         opt = json.loads(f.read())
+
     opt = Namespace(**opt)
-    main(opt, 0)
+
+    main(opt)

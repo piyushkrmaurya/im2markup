@@ -3,6 +3,7 @@ import torch
 from collections import defaultdict
 from torchtext.data import Field, RawField
 from data_reader import text_fields, image_fields
+from copy import deepcopy
 
 from loguru import logger
 

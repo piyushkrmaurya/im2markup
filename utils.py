@@ -1,6 +1,9 @@
 import math
+import os
 import sys
 import time
+from collections import deque
+from copy import deepcopy
 
 import torch
 from loguru import logger
@@ -26,15 +29,7 @@ def init_logger(log_file=None):
     return logger
 
 
-
 class ModelSaver:
-    """Base class for model saving operations
-
-    Inherited classes must implement private methods:
-    * `_save`
-    * `_rm_checkpoint
-    """
-
     def __init__(self, base_path, model, model_opt, fields, optim, keep_checkpoint=-1):
         self.base_path = base_path
         self.model = model
@@ -75,7 +70,6 @@ class ModelSaver:
                 todel = self.checkpoint_queue.popleft()
                 self._rm_checkpoint(todel)
             self.checkpoint_queue.append(chkpt_name)
-
 
     def _save(self, step, model):
         model_state_dict = model.state_dict()
@@ -123,7 +117,7 @@ class ReportManager:
         start_time(float): manually set report start time. Negative values
             means that you will need to set it later or use `start()`
     """
-       
+
     def __init__(self, report_every, start_time=-1.0):
         """
         A report manager that writes statistics on standard output as well as
@@ -134,7 +128,6 @@ class ReportManager:
         """
         self.report_every = report_every
         self.start_time = start_time
-
 
     def _report_training(self, step, num_steps, learning_rate, patience, report_stats):
         """
@@ -290,4 +283,3 @@ class Statistics:
             )
         )
         sys.stdout.flush()
-

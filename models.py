@@ -197,7 +197,6 @@ class Embeddings(nn.Module):
             word_vocab_size=num_word_embeddings,
             feat_vocab_sizes=num_feat_embeddings,
             sparse=opt.optim == "sparseadam",
-            fix_word_vecs=opt.fix_word_vecs_dec,
         )
 
     def _validate_args(
