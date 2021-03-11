@@ -17,14 +17,19 @@ from torch.nn.init import xavier_uniform_
 
 from dataset import DatasetIterator, IterOnDevice
 from loss import NMTLossCompute
-from models import Cast, Embeddings, ImageEncoder, InputFeedRNNDecoder, NMTModel
+from models import (
+    Cast,
+    Embeddings,
+    ImageEncoder,
+    InputFeedRNNDecoder,
+    NMTModel,
+    build_model,
+)
 from optimizer import Optimizer
 from utils import ModelSaver, ReportManager, Statistics
 
-# Fix CPU tensor sharing strategy
 torch.multiprocessing.set_sharing_strategy("file_system")
 
-# Ignore warnings
 warnings.filterwarnings("ignore")
 
 
@@ -48,93 +53,7 @@ def init_logger(log_file=None):
     return logger
 
 
-def build_model(model_opt, opt, fields, checkpoint):
-    logger.info("Building model...")
-
-    try:
-        model_opt.attention_dropout
-    except AttributeError:
-        model_opt.attention_dropout = model_opt.dropout
-
-    # Build encoder.
-    encoder = ImageEncoder.from_opt(model_opt)
-
-    # Build decoder.
-    tgt_field = fields["tgt"]
-    tgt_emb = Embeddings.from_opt(model_opt, tgt_field)
-    decoder = InputFeedRNNDecoder.from_opt(model_opt, tgt_emb)
-
-    # Build NMTModel(= encoder + decoder).
-    model = NMTModel(encoder, decoder)
-
-    # Build Generator.
-    generator = nn.Sequential(
-        nn.Linear(model_opt.dec_rnn_size, len(fields["tgt"].base_field.vocab)),
-        Cast(torch.float32),
-        nn.LogSoftmax(dim=-1),
-    )
-    if model_opt.share_decoder_embeddings:
-        generator[0].weight = decoder.embeddings.word_lut.weight
-
-    # Load the model states from checkpoint or initialize them.
-    if checkpoint is not None:
-        # This preserves backward-compat for models using customed layernorm
-        def fix_key(s):
-            s = re.sub(r"(.*)\.layer_norm((_\d+)?)\.b_2", r"\1.layer_norm\2.bias", s)
-            s = re.sub(r"(.*)\.layer_norm((_\d+)?)\.a_2", r"\1.layer_norm\2.weight", s)
-            return s
-
-        checkpoint["model"] = {fix_key(k): v for k, v in checkpoint["model"].items()}
-        # end of patch for backward compatibility
-
-        model.load_state_dict(checkpoint["model"], strict=False)
-        generator.load_state_dict(checkpoint["generator"], strict=False)
-    else:
-        if model_opt.param_init != 0.0:
-            for p in model.parameters():
-                p.data.uniform_(-model_opt.param_init, model_opt.param_init)
-            for p in generator.parameters():
-                p.data.uniform_(-model_opt.param_init, model_opt.param_init)
-        if model_opt.param_init_glorot:
-            for p in model.parameters():
-                if p.dim() > 1:
-                    xavier_uniform_(p)
-            for p in generator.parameters():
-                if p.dim() > 1:
-                    xavier_uniform_(p)
-
-        if hasattr(model.encoder, "embeddings"):
-            model.encoder.embeddings.load_pretrained_vectors(
-                model_opt.pre_word_vecs_enc
-            )
-        if hasattr(model.decoder, "embeddings"):
-            model.decoder.embeddings.load_pretrained_vectors(
-                model_opt.pre_word_vecs_dec
-            )
-
-    model.generator = generator
-
-    model.to(opt.device)
-
-    logger.info(model)
-
-    return model
-
-
 def build_trainer(opt, gpu_id, model, fields, optim, model_saver=None):
-    """
-    Simplify `Trainer` creation based on user `opt`s*
-
-    Args:
-        opt (:obj:`Namespace`): user options (usually from argument parsing)
-        model (:obj:`models.NMTModel`): the model to train
-        fields (dict): dict of fields
-        optim (:obj:`Optimizer`): optimizer used during training
-        data_type (str): string describing the type of data
-            e.g. "text", "img", "audio"
-        model_saver(:obj:`models.ModelSaverBase`): the utility object
-            used to save the model
-    """
 
     tgt_field = dict(fields)["tgt"].base_field
     train_loss = NMTLossCompute.from_opt(model, tgt_field, opt, device=opt.device)
@@ -142,7 +61,7 @@ def build_trainer(opt, gpu_id, model, fields, optim, model_saver=None):
         model, tgt_field, opt, train=False, device=opt.device
     )
 
-    trunc_size = opt.truncated_decoder  # Badly named...
+    trunc_size = opt.truncated_decoder
     shard_size = opt.max_generator_batches if opt.model_dtype == "fp32" else 0
     norm_method = opt.normalization
     accum_count = opt.accum_count
@@ -209,31 +128,6 @@ def build_trainer(opt, gpu_id, model, fields, optim, model_saver=None):
 
 
 class Trainer(object):
-    """
-    Class that controls the training process.
-
-    Args:
-            model(:py:class:`models.model.NMTModel`): translation model
-                to train
-            train_loss(:obj:`loss.LossComputeBase`):
-               training loss computation
-            valid_loss(:obj:`loss.LossComputeBase`):
-               training loss computation
-            optim(:obj:`optimizers.Optimizer`):
-               the optimizer responsible for update
-            trunc_size(int): length of truncated back propagation through time
-            shard_size(int): compute loss in shards of this size for efficiency
-            data_type(string): type of the source input: [text|img|audio]
-            norm_method(string): normalization methods: [sents|tokens]
-            accum_count(list): accumulate gradients this many times.
-            accum_steps(list): steps for accum gradients changes.
-            report_manager(:obj:`ReportMgrBase`):
-                the object that creates reports, or None
-            model_saver(:obj:`models.ModelSaverBase`): the saver is
-                used to save a checkpoint.
-                Thus nothing will be saved if this parameter is None
-    """
-
     def __init__(
         self,
         model,
@@ -258,7 +152,7 @@ class Trainer(object):
         dropout_steps=[0],
         source_noise=None,
     ):
-        # Basic attributes.
+
         self.model = model
         self.train_loss = train_loss
         self.valid_loss = valid_loss
@@ -288,10 +182,8 @@ class Trainer(object):
             if self.accum_count_l[i] > 1:
                 assert (
                     self.trunc_size == 0
-                ), """To enable accumulated gradients,
-                       you must disable target sequence truncating."""
+                ), "To enable accumulated gradients,you must disable target sequence truncating."
 
-        # Set model in training mode.
         self.model.train()
 
     def _accum_count(self, step):
@@ -350,21 +242,7 @@ class Trainer(object):
         valid_iter=None,
         valid_steps=10000,
     ):
-        """
-        The main training loop by iterating over `train_iter` and possibly
-        running validation on `valid_iter`.
 
-        Args:
-            train_iter: A generator that returns the next training batch.
-            train_steps: Run training for this many iterations.
-            save_checkpoint_steps: Save a checkpoint every this many
-              iterations.
-            valid_iter: A generator that returns the next validation batch.
-            valid_steps: Run evaluation every this many iterations.
-
-        Returns:
-            The gathered statistics.
-        """
         if valid_iter is None:
             logger.info("Start training loop without validation...")
         else:
@@ -378,7 +256,7 @@ class Trainer(object):
 
         for i, (batches, normalization) in enumerate(self._accum_batches(train_iter)):
             step = self.optim.training_step
-            # UPDATE DROPOUT
+
             self._maybe_update_dropout(step)
 
             if self.gpu_verbose_level > 1:
@@ -412,16 +290,14 @@ class Trainer(object):
                     )
                 valid_stats = self._maybe_gather_stats(valid_stats)
                 if self.gpu_verbose_level > 0:
-                    logger.info(
-                        "GPU Id %d: report stat step %d" % (self.gpu_id, step)
-                    )
+                    logger.info("GPU Id %d: report stat step %d" % (self.gpu_id, step))
                 self._report_step(
                     self.optim.learning_rate(), step, valid_stats=valid_stats
                 )
-                # Run patience mechanism
+
                 if self.earlystopper is not None:
                     self.earlystopper(valid_stats, step)
-                    # If the patience has reached the limit, stop training
+
                     if self.earlystopper.has_stopped():
                         break
 
@@ -438,15 +314,10 @@ class Trainer(object):
         return total_stats
 
     def validate(self, valid_iter, moving_average=None):
-        """Validate model.
-            valid_iter: validate data iterator
-        Returns:
-            :obj:`nmt.Statistics`: validation loss statistics
-        """
+
         valid_model = self.model
         if moving_average:
-            # swap model params w/ moving average
-            # (and keep the original parameters)
+
             model_params_data = []
             for avg, param in zip(self.moving_average, valid_model.parameters()):
                 model_params_data.append(param.data)
@@ -454,7 +325,6 @@ class Trainer(object):
                     avg.data.half() if self.optim._fp16 == "legacy" else avg.data
                 )
 
-        # Set model in validating mode.
         valid_model.eval()
 
         with torch.no_grad():
@@ -467,19 +337,16 @@ class Trainer(object):
                 tgt = batch.tgt
 
                 with torch.cuda.amp.autocast(enabled=self.optim.amp):
-                    # F-prop through the model.
+
                     outputs, attns = valid_model(src, tgt, src_lengths)
 
-                    # Compute loss.
                     _, batch_stats = self.valid_loss(batch, outputs, attns)
 
-                # Update statistics.
                 stats.update(batch_stats)
         if moving_average:
             for param_data, param in zip(model_params_data, self.model.parameters()):
                 param.data = param_data
 
-        # Set model back to training mode.
         valid_model.train()
 
         return stats
@@ -492,7 +359,7 @@ class Trainer(object):
 
         for k, batch in enumerate(true_batches):
             target_size = batch.tgt.size(0)
-            # Truncated BPTT: reminder not compatible with accum > 1
+
             if self.trunc_size:
                 trunc_size = self.trunc_size
             else:
@@ -510,10 +377,9 @@ class Trainer(object):
 
             bptt = False
             for j in range(0, target_size - 1, trunc_size):
-                # 1. Create truncated target.
+
                 tgt = tgt_outer[j : j + trunc_size]
 
-                # 2. F-prop all but generator.
                 if self.accum_count == 1:
                     self.optim.zero_grad()
 
@@ -521,7 +387,6 @@ class Trainer(object):
                     outputs, attns = self.model(src, tgt, src_lengths, bptt=bptt)
                     bptt = True
 
-                    # 3. Compute loss.
                     loss, batch_stats = self.train_loss(
                         batch,
                         outputs,
@@ -546,26 +411,17 @@ class Trainer(object):
                         % (self.optim.training_step, k)
                     )
 
-                # 4. Update the parameters and statistics.
                 if self.accum_count == 1:
                     self.optim.step()
 
-                # If truncated, don't backprop fully.
-                # TO CHECK
-                # if dec_state is not None:
-                #    dec_state.detach()
                 if self.model.decoder.state is not None:
                     self.model.decoder.detach_state()
 
-        # in case of multi step gradient accumulation,
-        # update only after accum batches
         if self.accum_count > 1:
             self.optim.step()
 
     def _start_report_manager(self, start_time=None):
-        """
-        Simple function to start report manager (if any)
-        """
+
         if self.report_manager is not None:
             if start_time is None:
                 self.report_manager.start()
@@ -573,25 +429,13 @@ class Trainer(object):
                 self.report_manager.start_time = start_time
 
     def _maybe_gather_stats(self, stat):
-        """
-        Gather statistics in multi-processes cases
 
-        Args:
-            stat(:obj:Statistics): a Statistics object to gather
-                or None (it returns None in this case)
-
-        Returns:
-            stat: the updated (or unchanged) stat object
-        """
         if stat is not None and self.n_gpu > 1:
             return Statistics.all_gather_stats(stat)
         return stat
 
     def _maybe_report_training(self, step, num_steps, learning_rate, report_stats):
-        """
-        Simple function to report training stats (if report_manager is set)
-        see `ReportManager.report_training` for doc
-        """
+
         if self.report_manager is not None:
             return self.report_manager.report_training(
                 step,
@@ -605,10 +449,7 @@ class Trainer(object):
             )
 
     def _report_step(self, learning_rate, step, train_stats=None, valid_stats=None):
-        """
-        Simple function to report stats (if report_manager is set)
-        see `ReportManager.report_step` for doc
-        """
+
         if self.report_manager is not None:
             return self.report_manager.report_step(
                 learning_rate,
@@ -689,13 +530,11 @@ def main(opt):
 
     fields = vocab
 
-    # patch for fields that may be missing in old data/model
     dvocab = torch.load(opt.data + ".vocab.pt")
     maybe_cid_field = dvocab.get("corpus_id", None)
     if maybe_cid_field is not None:
         fields.update({"corpus_id": maybe_cid_field})
 
-    # Report src and tgt vocab sizes, including for features
     for side in ["src", "tgt"]:
         f = fields[side]
         try:
@@ -706,7 +545,6 @@ def main(opt):
             if sf.use_vocab:
                 logger.info(" * %s vocab size = %d" % (sn, len(sf.vocab)))
 
-    # Build model.
     model = build_model(model_opt, opt, fields, checkpoint)
     n_params, enc, dec = tally_parameters(model)
     logger.info("encoder: %d" % enc)
@@ -714,10 +552,8 @@ def main(opt):
     logger.info("* number of parameters: %d" % n_params)
     check_save_model_path(opt)
 
-    # Build optimizer.
     optim = Optimizer.from_opt(model, opt, checkpoint=checkpoint)
 
-    # Build model saver
     model_saver = ModelSaver(
         opt.save_model, model, model_opt, fields, optim, opt.keep_checkpoint
     )

@@ -42,11 +42,6 @@ class ModelSaver:
             self.checkpoint_queue = deque([], maxlen=keep_checkpoint)
 
     def save(self, step, moving_average=None):
-        """Main entry point for model saver
-
-        It wraps the `_save` method with checks and apply `keep_checkpoint`
-        related logic
-        """
 
         if self.keep_checkpoint == 0 or step == self.last_saved_step:
             return
@@ -78,9 +73,6 @@ class ModelSaver:
         }
         generator_state_dict = model.generator.state_dict()
 
-        # NOTE: We need to trim the vocab to remove any unk tokens that
-        # were not originally here.
-
         vocab = deepcopy(self.fields)
         for side in ["src", "tgt"]:
             keys_to_pop = []
@@ -111,28 +103,13 @@ class ModelSaver:
 
 
 class ReportManager:
-    """
-    Args:
-        report_every(int): Report status every this many sentences
-        start_time(float): manually set report start time. Negative values
-            means that you will need to set it later or use `start()`
-    """
-
     def __init__(self, report_every, start_time=-1.0):
-        """
-        A report manager that writes statistics on standard output as well as
-        (optionally) TensorBoard
 
-        Args:
-            report_every(int): Report status every this many sentences
-        """
         self.report_every = report_every
         self.start_time = start_time
 
     def _report_training(self, step, num_steps, learning_rate, patience, report_stats):
-        """
-        See base class method `ReportMgrBase.report_training`.
-        """
+
         report_stats.output(step, num_steps, learning_rate, self.start_time)
 
         report_stats = Statistics()
@@ -140,9 +117,7 @@ class ReportManager:
         return report_stats
 
     def _report_step(self, lr, patience, step, train_stats=None, valid_stats=None):
-        """
-        See base class method `ReportMgrBase.report_step`.
-        """
+
         if train_stats is not None:
             self.log("Train perplexity: %g" % train_stats.ppl())
             self.log("Train accuracy: %g" % train_stats.accuracy())
@@ -160,23 +135,9 @@ class ReportManager:
     def report_training(
         self, step, num_steps, learning_rate, patience, report_stats, multigpu=False
     ):
-        """
-        This is the user-defined batch-level traing progress
-        report function.
 
-        Args:
-            step(int): current step count.
-            num_steps(int): total number of batches.
-            learning_rate(float): current learning rate.
-            report_stats(Statistics): old Statistics instance.
-        Returns:
-            report_stats(Statistics): updated Statistics instance.
-        """
         if self.start_time < 0:
-            raise ValueError(
-                """ReportManager needs to be started
-                                (set 'start_time' or use 'start()'"""
-            )
+            raise ValueError()
 
         if step % self.report_every == 0:
             if multigpu:
@@ -189,31 +150,13 @@ class ReportManager:
             return report_stats
 
     def report_step(self, lr, patience, step, train_stats=None, valid_stats=None):
-        """
-        Report stats of a step
 
-        Args:
-            lr(float): current learning rate
-            patience(int): current patience
-            step(int): current step
-            train_stats(Statistics): training stats
-            valid_stats(Statistics): validation stats
-        """
         self._report_step(
             lr, patience, step, train_stats=train_stats, valid_stats=valid_stats
         )
 
 
 class Statistics:
-    """
-    Accumulator for loss statistics.
-    Currently calculates:
-
-    * accuracy
-    * perplexity
-    * elapsed time
-    """
-
     def __init__(self, loss=0, n_words=0, n_correct=0):
         self.loss = loss
         self.n_words = n_words
@@ -222,15 +165,7 @@ class Statistics:
         self.start_time = time.time()
 
     def update(self, stat, update_n_src_words=False):
-        """
-        Update statistics by suming values with another `Statistics` object
 
-        Args:
-            stat: another statistic object
-            update_n_src_words(bool): whether to update (sum) `n_src_words`
-                or not
-
-        """
         self.loss += stat.loss
         self.n_words += stat.n_words
         self.n_correct += stat.n_correct
@@ -239,29 +174,23 @@ class Statistics:
             self.n_src_words += stat.n_src_words
 
     def accuracy(self):
-        """ compute accuracy """
+
         return 100 * (self.n_correct / self.n_words)
 
     def xent(self):
-        """ compute cross entropy """
+
         return self.loss / self.n_words
 
     def ppl(self):
-        """ compute perplexity """
+
         return math.exp(min(self.loss / self.n_words, 100))
 
     def elapsed_time(self):
-        """ compute elapsed time """
+
         return time.time() - self.start_time
 
     def output(self, step, num_steps, learning_rate, start):
-        """Write out statistics to stdout.
 
-        Args:
-           step (int): current step
-           n_batch (int): total batches
-           start (int): start time of step.
-        """
         t = self.elapsed_time()
         step_fmt = "%2d" % step
         if num_steps > 0:

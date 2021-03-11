@@ -10,23 +10,27 @@ from torchvision import transforms
 
 from itertools import islice, repeat
 
+
 def text_sort_key(ex):
-    """Sort using the number of tokens in the sequence."""
+
     if hasattr(ex, "tgt"):
         return len(ex.src[0]), len(ex.tgt[0])
     return len(ex.src[0])
 
+
 def img_sort_key(ex):
-    """Sort using the size of the image: (width, height)."""
+
     return ex.src.size(2), ex.src.size(1)
+
 
 def _read_file(path):
     with open(path, "rb") as f:
         for line in f:
             yield line
 
+
 def _split_corpus(path, shard_size):
-    """Yield a `list` containing `shard_size` line of `path`."""
+
     with open(path, "rb") as f:
         if shard_size <= 0:
             yield f.readlines()
@@ -39,22 +43,14 @@ def _split_corpus(path, shard_size):
 
 
 def split_corpus(path, shard_size, default=None):
-    """yield a `list` containing `shard_size` line of `path`,
-    or repeatly generate `default` if `path` is None.
-    """
+
     if path is not None:
         return _split_corpus(path, shard_size)
     else:
         return repeat(default)
 
-class ImageDataReader:
-    """Read image data from disk.
-    Args:
-        truncate (tuple[int] or NoneType): maximum img size. Use
-            ``(0,0)`` or ``None`` for unlimited.
-        channel_size (int): Number of channels per image.
-    """
 
+class ImageDataReader:
     def __init__(self, truncate=None, channel_size=3):
         self._check_deps()
         self.truncate = truncate
@@ -67,22 +63,10 @@ class ImageDataReader:
     @classmethod
     def _check_deps(cls):
         if any([Image is None, transforms is None, cv2 is None]):
-            cls._raise_missing_dep(
-                "PIL", "torchvision", "cv2")
+            cls._raise_missing_dep("PIL", "torchvision", "cv2")
 
     def read(self, images, side, img_dir=None):
-        """Read data into dicts.
-        Args:
-            images (str or Iterable[str]): Sequence of image paths or
-                path to file containing audio paths.
-                In either case, the filenames may be relative to ``src_dir``
-                (default behavior) or absolute.
-            side (str): Prefix used in return dict. Usually
-                ``"src"`` or ``"tgt"``.
-            img_dir (str): Location of source image files. See ``images``.
-        Yields:
-            a dictionary containing image data, path and index for each line.
-        """
+
         if isinstance(images, str):
             images = _read_file(images)
 
@@ -92,38 +76,22 @@ class ImageDataReader:
             if not os.path.exists(img_path):
                 img_path = filename
 
-            assert os.path.exists(img_path), \
-                'img path %s not found' % filename
+            assert os.path.exists(img_path), "img path %s not found" % filename
 
             if self.channel_size == 1:
-                img = transforms.ToTensor()(
-                    Image.fromarray(cv2.imread(img_path, 0)))
+                img = transforms.ToTensor()(Image.fromarray(cv2.imread(img_path, 0)))
             else:
-                img = Image.open(img_path).convert('RGB')
+                img = Image.open(img_path).convert("RGB")
                 img = transforms.ToTensor()(img)
             if self.truncate and self.truncate != (0, 0):
-                if not (img.size(1) <= self.truncate[0]
-                        and img.size(2) <= self.truncate[1]):
+                if not (
+                    img.size(1) <= self.truncate[0] and img.size(2) <= self.truncate[1]
+                ):
                     continue
-            yield {side: img, side + '_path': filename, 'indices': i}
+            yield {side: img, side + "_path": filename, "indices": i}
 
 
 class TextMultiField(RawField):
-    """Container for subfields.
-    Text data might use POS/NER/etc labels in addition to tokens.
-    This class associates the "base" :class:`Field` with any subfields.
-    It also handles padding the data and stacking it.
-    Args:
-        base_name (str): Name for the base field.
-        base_field (Field): The token field.
-        feats_fields (Iterable[Tuple[str, Field]]): A list of name-field
-            pairs.
-    Attributes:
-        fields (Iterable[Tuple[str, Field]]): A list of name-field pairs.
-            The order is defined as the base field first, then
-            ``feats_fields`` in alphabetical order.
-    """
-
     def __init__(self, base_name, base_field, feats_fields):
         super(TextMultiField, self).__init__()
         self.fields = [(base_name, base_field)]
@@ -135,32 +103,19 @@ class TextMultiField(RawField):
         return self.fields[0][1]
 
     def process(self, batch, device=None):
-        """Convert outputs of preprocess into Tensors.
-        Args:
-            batch (List[List[List[str]]]): A list of length batch size.
-                Each element is a list of the preprocess results for each
-                field (which are lists of str "words" or feature tags.
-            device (torch.device or str): The device on which the tensor(s)
-                are built.
-        Returns:
-            torch.LongTensor or Tuple[LongTensor, LongTensor]:
-                A tensor of shape ``(seq_len, batch_size, len(self.fields))``
-                where the field features are ordered like ``self.fields``.
-                If the base field returns lengths, these are also returned
-                and have shape ``(batch_size,)``.
-        """
 
-        # batch (list(list(list))): batch_size x len(self.fields) x seq_len
         batch_by_feat = list(zip(*batch))
         base_data = self.base_field.process(batch_by_feat[0], device=device)
         if self.base_field.include_lengths:
-            # lengths: batch_size
+
             base_data, lengths = base_data
 
-        feats = [ff.process(batch_by_feat[i], device=device)
-                 for i, (_, ff) in enumerate(self.fields[1:], 1)]
+        feats = [
+            ff.process(batch_by_feat[i], device=device)
+            for i, (_, ff) in enumerate(self.fields[1:], 1)
+        ]
         levels = [base_data] + feats
-        # data: seq_len x batch_size x len(self.fields)
+
         data = torch.stack(levels, 2)
         if self.base_field.include_lengths:
             return data, lengths
@@ -168,14 +123,6 @@ class TextMultiField(RawField):
             return data
 
     def preprocess(self, x):
-        """Preprocess data.
-        Args:
-            x (str): A sentence string (words joined by whitespace).
-        Returns:
-            List[List[str]]: A list of length ``len(self.fields)`` containing
-                lists of tokens/feature tags for the sentence. The output
-                is ordered like ``self.fields``.
-        """
 
         return [f.preprocess(x) for _, f in self.fields]
 
@@ -183,22 +130,7 @@ class TextMultiField(RawField):
         return self.fields[item]
 
 
-
-def _feature_tokenize(
-        string, layer=0, tok_delim=None, feat_delim=None, truncate=None):
-    """Split apart word features (like POS/NER tags) from the tokens.
-    Args:
-        string (str): A string with ``tok_delim`` joining tokens and
-            features joined by ``feat_delim``. For example,
-            ``"hello|NOUN|'' Earth|NOUN|PLANET"``.
-        layer (int): Which feature to extract. (Not used if there are no
-            features, indicated by ``feat_delim is None``). In the
-            example above, layer 2 is ``'' PLANET``.
-        truncate (int or NoneType): Restrict sequences to this length of
-            tokens.
-    Returns:
-        List[str] of tokens.
-    """
+def _feature_tokenize(string, layer=0, tok_delim=None, feat_delim=None, truncate=None):
 
     tokens = string.split(tok_delim)
     if truncate is not None:
@@ -209,18 +141,6 @@ def _feature_tokenize(
 
 
 def text_fields(**kwargs):
-    """Create text fields.
-    Args:
-        base_name (str): Name associated with the field.
-        n_feats (int): Number of word level feats (not counting the tokens)
-        include_lengths (bool): Optionally return the sequence lengths.
-        pad (str, optional): Defaults to ``"<blank>"``.
-        bos (str or NoneType, optional): Defaults to ``"<s>"``.
-        eos (str or NoneType, optional): Defaults to ``"</s>"``.
-        truncate (bool or NoneType, optional): Defaults to ``None``.
-    Returns:
-        TextMultiField
-    """
 
     n_feats = kwargs["n_feats"]
     include_lengths = kwargs["include_lengths"]
@@ -234,40 +154,43 @@ def text_fields(**kwargs):
     for i in range(n_feats + 1):
         name = base_name + "_feat_" + str(i - 1) if i > 0 else base_name
         tokenize = partial(
-            _feature_tokenize,
-            layer=i,
-            truncate=truncate,
-            feat_delim=feat_delim)
+            _feature_tokenize, layer=i, truncate=truncate, feat_delim=feat_delim
+        )
         use_len = i == 0 and include_lengths
         feat = Field(
-            init_token=bos, eos_token=eos,
-            pad_token=pad, tokenize=tokenize,
-            include_lengths=use_len)
+            init_token=bos,
+            eos_token=eos,
+            pad_token=pad,
+            tokenize=tokenize,
+            include_lengths=use_len,
+        )
         fields_.append((name, feat))
-    assert fields_[0][0] == base_name  # sanity check
+    assert fields_[0][0] == base_name
     field = TextMultiField(fields_[0][0], fields_[0][1], fields_[1:])
     return field
 
+
 def batch_img(data, vocab):
-    """Pad and batch a sequence of images."""
+
     c = data[0].size(0)
     h = max([t.size(1) for t in data])
     w = max([t.size(2) for t in data])
     imgs = torch.zeros(len(data), c, h, w).fill_(1)
     for i, img in enumerate(data):
-        imgs[i, :, 0:img.size(1), 0:img.size(2)] = img
+        imgs[i, :, 0 : img.size(1), 0 : img.size(2)] = img
     return imgs
+
 
 def image_fields(**kwargs):
     img = Field(
-        use_vocab=False, dtype=torch.float,
-        postprocessing=batch_img, sequential=False)
+        use_vocab=False, dtype=torch.float, postprocessing=batch_img, sequential=False
+    )
     return img
+
 
 class TextDataReader:
     def read(self, sequences, side, _dir=None):
-        assert _dir is None or _dir == "", \
-            "Cannot use _dir with TextDataReader."
+        assert _dir is None or _dir == "", "Cannot use _dir with TextDataReader."
         if isinstance(sequences, str):
             sequences = _read_file(sequences)
         for i, seq in enumerate(sequences):

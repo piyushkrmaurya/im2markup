@@ -33,7 +33,7 @@ from vocab import (
 
 
 def check_existing_pt_files(opt, corpus_type, ids, existing_fields):
-    """ Check if there are existing .pt files to avoid overwriting them """
+
     existing_shards = []
     for maybe_id in ids:
         if maybe_id:
@@ -73,7 +73,7 @@ def process_one_shard(corpus_params, params):
         tgt_vocab,
     ) = corpus_params
     i, (src_shard, tgt_shard, align_shard, maybe_id, filter_pred) = params
-    # create one counter per shard
+
     sub_sub_counter = defaultdict(Counter)
     assert len(src_shard) == len(tgt_shard)
     logger.info("Building shard %d." % i)
@@ -179,16 +179,13 @@ def build_save_dataset(corpus_type, fields, src_reader, tgt_reader, align_reader
 
     existing_shards = check_existing_pt_files(opt, corpus_type, ids, existing_fields)
 
-    # every corpus has shards, no new one
     if existing_shards == ids and not opt.overwrite:
         return
 
     def shard_iterator(
         srcs, tgts, ids, aligns, existing_shards, existing_fields, corpus_type, opt
     ):
-        """
-        Builds a single iterator yielding every shard of every corpus.
-        """
+
         for src, tgt, maybe_id, maybe_align in zip(srcs, tgts, ids, aligns):
             if maybe_id in existing_shards:
                 if opt.overwrite:
@@ -269,7 +266,6 @@ def build_save_dataset(corpus_type, fields, src_reader, tgt_reader, align_reader
                 fields, opt.data_type, dynamic_dict=opt.dynamic_dict
             )
 
-        # patch corpus_id
         if fields.get("corpus_id", False):
             fields["corpus_id"].vocab = new_fields["corpus_id"].vocab_cls(
                 counters["corpus_id"]
@@ -279,11 +275,7 @@ def build_save_dataset(corpus_type, fields, src_reader, tgt_reader, align_reader
 
 
 def count_features(path):
-    """
-    path: location of a corpus file with whitespace-delimited tokens and
-                    ￨-delimited features within the token
-    returns: the number of features in the dataset
-    """
+
     with codecs.open(path, "r", "utf-8") as f:
         first_tok = f.readline().split(None, 1)[0]
         return len(first_tok.split(u"￨")) - 1
@@ -299,7 +291,7 @@ def preprocess(opt):
     src_nfeats = 0
     tgt_nfeats = 0
     src_nfeats = count_features(opt.train_src[0]) if opt.data_type == "text" else 0
-    tgt_nfeats = count_features(opt.train_tgt[0])  # tgt always text so far
+    tgt_nfeats = count_features(opt.train_tgt[0])
     if len(opt.train_src) > 1 and opt.data_type == "text":
         for src, tgt in zip(opt.train_src[1:], opt.train_tgt[1:]):
             assert src_nfeats == count_features(src), (

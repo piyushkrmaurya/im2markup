@@ -5,7 +5,7 @@ import cv2
 
 def crop_image(img, default_size=None):
     old_im = img.convert("L")
-    img_data = np.asarray(old_im, dtype=np.uint8)  # height, width
+    img_data = np.asarray(old_im, dtype=np.uint8)  
     nnz_inds = np.where(img_data != 255)
     if len(nnz_inds[0]) == 0:
         if not default_size:
