@@ -10,6 +10,7 @@ import warnings
 from argparse import Namespace
 from collections import deque
 
+import numpy as np
 import torch
 import torch.nn as nn
 from loguru import logger
@@ -26,32 +27,13 @@ from models import (
     build_model,
 )
 from optimizer import Optimizer
-from utils import ModelSaver, ReportManager, Statistics
+from utils import ModelSaver, ReportManager, Statistics, init_logger
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 warnings.filterwarnings("ignore")
 
-
-def init_logger(log_file=None):
-    logger.remove()
-
-    logger.add(
-        sys.stdout,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS!UTC}</green> | <level>{level: <8}</level> |"
-        " <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    )
-
-    logger.add(
-        log_file,
-        backtrace=True,
-        diagnose=True,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS!UTC}</green> | <level>{level: <8}</level> |"
-        " <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    )
-
-    return logger
-
+prefix = str(hex(int(time.time())))[2:] + "_"
 
 def build_trainer(opt, gpu_id, model, fields, optim, model_saver=None):
 
@@ -488,9 +470,12 @@ def tally_parameters(model):
 def configure_device(opt):
 
     if opt.seed > 0:
-        torch.manual_seed(opt.seed)
+        os.environ["PYTHONHASHSEED"] = str(opt.seed)
         random.seed(opt.seed)
+        np.random.seed(opt.seed)
+        torch.manual_seed(opt.seed)
         torch.backends.cudnn.deterministic = True
+
 
     if opt.device == "cuda":
         if opt.gpu_id >= 0:
@@ -507,7 +492,7 @@ def configure_device(opt):
 def main(opt):
     configure_device(opt)
 
-    init_logger(opt.log_file)
+    init_logger(prefix + opt.log_file)
 
     assert len(opt.accum_count) == len(
         opt.accum_steps
@@ -555,7 +540,7 @@ def main(opt):
     optim = Optimizer.from_opt(model, opt, checkpoint=checkpoint)
 
     model_saver = ModelSaver(
-        opt.save_model, model, model_opt, fields, optim, opt.keep_checkpoint
+        prefix + opt.save_model, model, model_opt, fields, optim, opt.keep_checkpoint
     )
 
     trainer = build_trainer(
@@ -579,13 +564,19 @@ def main(opt):
         logger.warning("Option single_pass is enabled, ignoring train_steps.")
         train_steps = 0
 
-    trainer.train(
-        train_iter,
-        train_steps,
-        save_checkpoint_steps=opt.save_checkpoint_steps,
-        valid_iter=valid_iter,
-        valid_steps=opt.valid_steps,
-    )
+    try:
+        trainer.train(
+            train_iter,
+            train_steps,
+            save_checkpoint_steps=opt.save_checkpoint_steps,
+            valid_iter=valid_iter,
+            valid_steps=opt.valid_steps,
+        )
+    except KeyboardInterrupt:
+        print("Execution interrupted by the user.")
+    except Exception:
+        traceback.print_exc()
+        os.remove(prefix + opt.log_file)
 
 
 if __name__ == "__main__":

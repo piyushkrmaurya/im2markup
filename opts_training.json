@@ -26,9 +26,9 @@
 
   "gpu_verbose_level": 0,
   "device": "cuda",
-  "gpu_id": 1,
+  "gpu_id": 2,
 
-  "seed": 1,
+  "seed": 12,
   "param_init": 0.1,
   "param_init_glorot": false,
 
@@ -82,7 +82,7 @@
 
 
   "report_every": 50,
-  "log_file": "log_training.log",
+  "log_file": "train.log",
 
   "image_channel_size": 1
 }

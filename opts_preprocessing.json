@@ -22,7 +22,7 @@
     "train_ids": [null],
     "train_align": [null],
     "image_channel_size": 1,
-    "log_file": "log_preprocessing.log",
+    "log_file": "preprocess.log",
     "overwrite": false,
     "valid_align": null,
     "filter_valid": false,
